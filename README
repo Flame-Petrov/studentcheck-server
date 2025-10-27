@@ -1,5 +1,7 @@
 PSQL Commands:
 
+CMD => psql {External Database URL}
+
 \dt - list all tables
 \d {table name} - show table details
 
