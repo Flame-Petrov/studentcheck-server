@@ -1,1 +1,6 @@
-read me
+PSQL Commands:
+
+\dt - list all tables
+\d {table name} - show table details
+
+SELECT * FROM {table name}
