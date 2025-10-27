@@ -47,4 +47,17 @@ app.post("/studentLogin", async (req, res) => {
     res.send({ message: "Student login successful" });
 });
 
+app.post("/registration", async (req, res) => {
+
+    console.log();
+    console.log('Received POST /registration');
+    console.log('Request body:', req.body);
+    const user = req.body;
+    await pool.query(
+    //   "INSERT INTO users (username, password, full_name, email) VALUES ($1, $2, $3, $4)",
+    //   [user.username, user.password, user.fullName, user.email]
+    );
+    res.send({ message: "User registration successful", user: user });
+});
+
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
