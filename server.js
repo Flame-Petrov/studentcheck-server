@@ -1,3 +1,6 @@
+const PORT = process.env.PORT || 3000;
+
+
 const express = require("express");
 const { Pool } = require("pg"); // PostgreSQL client
 
@@ -9,11 +12,11 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL, // we'll use this later
 });
 
-app.post("/register", async (req, res) => {
-    console.log("🔐 Registering a new user");
-    const { email, password } = req.body;
-    await pool.query("INSERT INTO users (email, password) VALUES ($1, $2)", [email, password]);
-    res.send("User registered!");
+app.post("/studentLogin", async (req, res) => {
+    console.log("🔐 Student Loged In");
+    const { username, password } = req.body;
+    // await pool.query("INSERT INTO users (username, password) VALUES ($1, $2)", [username, password]);
+    res.send("User logged in!");
 });
 
-app.listen(3000, () => console.log("✅ Server running on port 3000"));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
