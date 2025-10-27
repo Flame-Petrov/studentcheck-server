@@ -28,7 +28,7 @@ app.post("/studentLogin", async (req, res) => {
     console.log("🔐 Student Logged In");
     const { username, password } = req.body;
     // await pool.query("INSERT INTO users (username, password) VALUES ($1, $2)", [username, password]);
-    res.send("User logged in!");
+    res.send({ message: "Student login successful" });
 });
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
