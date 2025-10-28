@@ -35,6 +35,56 @@ const pool = new Pool({
   }
 })();
 
+app.post("/teacherLogin", async (req, res) => {
+
+    console.log();
+    console.log('Received POST /teacherLogin');
+    console.log('Request body:', req.body);
+
+    try {
+        const { email, password } = req.body;
+
+        // Validate input
+        if (!email || !password) {
+            return res.status(400).send({ 
+                error: "Email and password are required" 
+            });
+        }
+
+        console.log("🔐 Checking teacher credentials for email:", email)
+        
+        // Query database to check if teacher exists with matching credentials
+        const result = await pool.query(
+            "SELECT * FROM teachers WHERE email = $1 AND password = $2",
+            [email, password]
+        );
+
+        if (result.rows.length > 0) {
+            console.log("✅ Teacher login successful");
+            const teacher = result.rows[0];
+            res.send({ 
+                message: "Teacher login successful", 
+                teacher: {
+                    email: teacher.email,
+                    fullName: teacher.full_name
+                },
+                loginSuccess: true
+            });
+        } else {
+            console.log("❌ Invalid credentials");
+            res.status(401).send({ 
+                error: "Invalid email or password" 
+            });
+        }
+
+    } catch (error) {
+        console.error("❌ Database error during login:", error);
+        res.status(500).send({ 
+            error: "Internal server error" 
+        });
+    }
+});
+
 app.post("/studentLogin", async (req, res) => {
 
     console.log();
