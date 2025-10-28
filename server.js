@@ -91,9 +91,10 @@ app.post("/registration", async (req, res) => {
     console.log('Received POST /registration');
     console.log('Request body:', req.body);
     const user = req.body;
+    const fullName = `${user.firstName} ${user.middleName} ${user.lastName}`;
     await pool.query(
-    //   "INSERT INTO users (username, password, full_name, email) VALUES ($1, $2, $3, $4)",
-    //   [user.username, user.password, user.fullName, user.email]
+      "INSERT INTO students (full_name, email, faculty_number, password) VALUES ($1, $2, $3, $4)",
+      [fullName, user.email, user.facultyNumber, user.password]
     );
     res.send({ message: "User registration successful", user: user });
 });
