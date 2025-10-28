@@ -1,6 +1,13 @@
 PSQL Commands:
 
-CMD => psql {External Database URL}
+- To enable UTF-8 encoding for terminal run:
+chcp 65001
+
+- To enter the database run:
+psql {External Database URL}
+
+- To enable PostgreSQL table to display UTF-8 characters run:
+\encoding UTF-8
 
 \dt - list all tables
 \d {table name} - show table details

@@ -68,7 +68,8 @@ app.post("/studentLogin", async (req, res) => {
                     facultyNumber: student.faculty_number,
                     fullName: student.full_name,
                     email: student.email
-                }
+                },
+                loginSuccess: true
             });
         } else {
             console.log("❌ Invalid credentials");
@@ -97,7 +98,7 @@ app.post("/registration", async (req, res) => {
       [fullName, user.email, user.facultyNumber, user.password]
     );
     const student = result.rows[0]; // <- the inserted record
-    res.send({ message: "User registration successful", student: student });
+    res.send({ message: "User registration successful", student: student, registrationSuccess: true });
 });
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
