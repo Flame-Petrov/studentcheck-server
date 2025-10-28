@@ -55,7 +55,7 @@ app.post("/studentLogin", async (req, res) => {
 
         // Query database to check if student exists with matching credentials
         const result = await pool.query(
-            "SELECT * FROM users WHERE faculty_number = $1 AND password = $2",
+            "SELECT * FROM students WHERE faculty_number = $1 AND password = $2",
             [facultyNumber, password]
         );
 
