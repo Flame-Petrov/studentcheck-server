@@ -41,10 +41,48 @@ app.post("/studentLogin", async (req, res) => {
     console.log('Received POST /studentLogin');
     console.log('Request body:', req.body);
 
-    console.log("🔐 Student Logged In");
-    const { username, password } = req.body;
-    // await pool.query("INSERT INTO users (username, password) VALUES ($1, $2)", [username, password]);
-    res.send({ message: "Student login successful" });
+    try {
+        const { facultyNumber, password } = req.body;
+
+        // Validate input
+        if (!facultyNumber || !password) {
+            return res.status(400).send({ 
+                error: "Faculty number and password are required" 
+            });
+        }
+
+        console.log("🔐 Checking student credentials for faculty number:", facultyNumber);
+
+        // Query database to check if student exists with matching credentials
+        const result = await pool.query(
+            "SELECT * FROM users WHERE faculty_number = $1 AND password = $2",
+            [facultyNumber, password]
+        );
+
+        if (result.rows.length > 0) {
+            console.log("✅ Student login successful");
+            const student = result.rows[0];
+            res.send({ 
+                message: "Student login successful", 
+                student: {
+                    facultyNumber: student.faculty_number,
+                    fullName: student.full_name,
+                    email: student.email
+                }
+            });
+        } else {
+            console.log("❌ Invalid credentials");
+            res.status(401).send({ 
+                error: "Invalid faculty number or password" 
+            });
+        }
+
+    } catch (error) {
+        console.error("❌ Database error during login:", error);
+        res.status(500).send({ 
+            error: "Internal server error" 
+        });
+    }
 });
 
 app.post("/registration", async (req, res) => {
