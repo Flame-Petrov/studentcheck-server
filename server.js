@@ -6,13 +6,14 @@ const cors = require("cors");
 const { Pool } = require("pg"); // PostgreSQL client
 
 const app = express();
-app.use(express.json());
+
 app.use(cors({
   origin: "https://studentcheck-9ucp.onrender.com", // ✅ your frontend Render URL
   methods: ["GET", "POST"],
   credentials: true
 }));
-
+app.options("*", cors()); // enable pre-flight for all routes
+app.use(express.json());
 
 // connect to PostgreSQL
 const pool = new Pool({
