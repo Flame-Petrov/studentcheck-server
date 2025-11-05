@@ -1,5 +1,5 @@
 const PORT = process.env.PORT || 3000;
-const DATABASE_URL = "postgresql://USER:***REMOVED***@HOST/DATABASE";
+const DATABASE_URL = "postgresql://postgres:***REMOVED***@DB_HOST:5432/postgres";
 
 const express = require("express");
 const cors = require("cors");
@@ -7,6 +7,7 @@ const { Pool } = require("pg"); // PostgreSQL client
 
 const app = express();
 
+// cors should be the thing used by "app"
 app.use(cors({
   origin: "https://studentcheck-9ucp.onrender.com", // ✅ your frontend Render URL
   methods: ["GET", "POST"],
