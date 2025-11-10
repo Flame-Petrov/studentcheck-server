@@ -156,7 +156,10 @@ app.post("/registration", async (req, res) => {
 app.get("/students", async (req, res) => {
     console.log();
     console.log('Received GET /students');
-    res.send({message: "Students endpoint reached" });
+    var result = await pool.query("SELECT * FROM students");
+    console.log('Query result:', result);
+    result = result.rows;
+    res.send({message: "Students endpoint reached", students: result });
 });
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
