@@ -157,8 +157,9 @@ app.get("/students", async (req, res) => {
     console.log();
     console.log('Received GET /students');
     var result = await pool.query("SELECT * FROM students");
-    console.log('Query result:', result);
+    console.log('Query result:', result.rows);
     result = result.rows;
+    console.log('Processed result:', result);
     res.send({message: "Students endpoint reached", students: result });
 });
 
