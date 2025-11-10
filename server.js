@@ -153,8 +153,9 @@ app.post("/registration", async (req, res) => {
     res.send({ message: "User registration successful", student: student, registrationSuccess: true });
 });
 
-app.post("/students", async (req, res) => {
-
+app.get("/students", async (req, res) => {
+    console.log();
+    console.log('Received GET /students');
     res.send({message: "Students endpoint reached" });
 });
 
