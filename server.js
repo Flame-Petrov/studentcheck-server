@@ -153,4 +153,9 @@ app.post("/registration", async (req, res) => {
     res.send({ message: "User registration successful", student: student, registrationSuccess: true });
 });
 
+app.post("/students", async (req, res) => {
+
+    console.log("Request to /students endpoint");
+});
+
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
