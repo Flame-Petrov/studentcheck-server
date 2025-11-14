@@ -142,15 +142,33 @@ app.post("/registration", async (req, res) => {
 
     console.log();
     console.log('Received POST /registration');
-    console.log('Request body:', req.body);
-    const user = req.body;
-    const fullName = `${user.firstName} ${user.middleName} ${user.lastName}`;
-    const result = await pool.query(
-      "INSERT INTO students (full_name, email, faculty_number, password, created) VALUES ($1, $2, $3, $4, $5)",
-      [fullName, user.email, user.facultyNumber, user.password, new Date()]
-    );
-    const student = result.rows[0]; // <- the inserted record
-    res.send({ message: "User registration successful", student: student, registrationSuccess: true });
+    // Avoid logging passwords in plaintext
+    const { password: _pw, ...safeBody } = req.body || {};
+    console.log('Request body (sanitized):', safeBody);
+
+    try {
+        const user = req.body;
+        const fullName = `${user.firstName} ${user.middleName || ''} ${user.lastName}`.replace(/\s+/g, ' ').trim();
+
+        const result = await pool.query(
+          "INSERT INTO students (full_name, email, faculty_number, password, created) VALUES ($1, $2, $3, $4, $5) RETURNING id, full_name, email, faculty_number, created",
+          [fullName, user.email, user.facultyNumber, user.password, new Date()]
+        );
+
+        const student = result.rows[0]; // inserted record without sensitive fields
+        return res.send({ message: "User registration successful", student, registrationSuccess: true });
+    } catch (error) {
+        // Unique violation (email or other unique columns)
+        if (error && error.code === '23505') {
+            console.warn('⚠️ Duplicate registration attempt:', error.detail || error.constraint);
+            return res.status(409).send({ 
+                error: "An account with these details already exists (email or faculty number)",
+                registrationSuccess: false
+            });
+        }
+        console.error("❌ Database error during registration:", error);
+        return res.status(500).send({ error: "Internal server error", registrationSuccess: false });
+    }
 });
 
 app.get("/students", async (req, res) => {
