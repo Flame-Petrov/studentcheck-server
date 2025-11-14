@@ -25,6 +25,10 @@ const pool = new Pool({
   },
 });
 
+
+
+
+
 (async () => {
   try {
     const client = await pool.connect();
@@ -36,6 +40,12 @@ const pool = new Pool({
     console.error("❌ Database connection error:", err);
   }
 })();
+
+
+
+
+
+
 
 app.post("/teacherLogin", async (req, res) => {
 
@@ -86,6 +96,11 @@ app.post("/teacherLogin", async (req, res) => {
         });
     }
 });
+
+
+
+
+
 
 app.post("/studentLogin", async (req, res) => {
 
@@ -138,6 +153,12 @@ app.post("/studentLogin", async (req, res) => {
     }
 });
 
+
+
+
+
+
+
 app.post("/registration", async (req, res) => {
 
     console.log();
@@ -171,6 +192,13 @@ app.post("/registration", async (req, res) => {
     }
 });
 
+
+
+
+
+
+
+
 app.get("/students", async (req, res) => {
     console.log();
     console.log('Received GET /students');
@@ -180,5 +208,9 @@ app.get("/students", async (req, res) => {
     console.log('Processed result:', result);
     res.send({message: "Students endpoint reached", students: result });
 });
+
+
+
+
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
