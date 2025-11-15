@@ -215,6 +215,9 @@ app.get("/students", async (req, res) => {
 
 // Lightweight heartbeat endpoint: fast 204, no caching, accepts any method
 app.all("/heartbeat", (req, res) => {
+    console.log();
+    console.log(`Received ${req.method} /heartbeat`);
+    // Set no-cache headers
     res.set({
         "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
         "Pragma": "no-cache",
