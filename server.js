@@ -172,8 +172,8 @@ app.post("/registration", async (req, res) => {
         const fullName = `${user.firstName} ${user.middleName || ''} ${user.lastName}`.replace(/\s+/g, ' ').trim();
 
         const result = await pool.query(
-          "INSERT INTO students (full_name, email, faculty_number, password, created) VALUES ($1, $2, $3, $4, $5) RETURNING id, full_name, email, faculty_number, created",
-          [fullName, user.email, user.facultyNumber, user.password, new Date()]
+          "INSERT INTO students (full_name, email, faculty_number, password, created, group) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, full_name, email, faculty_number, created",
+          [fullName, user.email, user.facultyNumber, user.password, new Date(), user.group]
         );
 
         const student = result.rows[0]; // inserted record without sensitive fields
@@ -208,6 +208,23 @@ app.get("/students", async (req, res) => {
     console.log('Processed result:', result);
     res.send({message: "Students endpoint reached", students: result });
 });
+
+
+
+
+
+// Lightweight heartbeat endpoint: fast 204, no caching, accepts any method
+app.all("/heartbeat", (req, res) => {
+    res.set({
+        "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Surrogate-Control": "no-store"
+    });
+    // No body needed; 204 keeps it minimal and fast
+    res.status(204).end();
+});
+
 
 
 
