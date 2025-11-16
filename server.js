@@ -172,6 +172,7 @@ app.post("/registration", async (req, res) => {
         const fullName = `${user.firstName} ${user.middleName || ''} ${user.lastName}`.replace(/\s+/g, ' ').trim();
 
                 const result = await pool.query(
+                    // syntax for reserved word "group" needs quotes
                     "INSERT INTO students (full_name, email, faculty_number, password, created, \"group\") VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, full_name, email, faculty_number, created, \"group\"",
                     [fullName, user.email, user.facultyNumber, user.password, new Date(), user.group]
                 );
