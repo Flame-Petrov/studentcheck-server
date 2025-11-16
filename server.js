@@ -7,13 +7,34 @@ const { Pool } = require("pg"); // PostgreSQL client
 
 const app = express();
 
-// cors should be the thing used by "app"
+// Central CORS configuration (explicit preflight + allowed headers)
+const allowedOrigins = ["https://studentcheck-9ucp.onrender.com"]; // frontend origin(s)
 app.use(cors({
-  origin: "https://studentcheck-9ucp.onrender.com", // ✅ your frontend Render URL
-  methods: ["GET", "POST"],
-  credentials: true
+    origin: (origin, callback) => {
+        // Allow same-origin / server-to-server (no origin header) or listed origins
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error("Not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    credentials: true,
+    maxAge: 86400 // cache preflight for a day
 }));
-app.options("*", cors()); // enable pre-flight for all routes
+
+// Manual lightweight preflight handler (runs after cors sets headers)
+app.use((req, res, next) => {
+    if (req.method === "OPTIONS") {
+        // Extra headers in case cors library missed something
+        res.header("Access-Control-Allow-Origin", allowedOrigins[0]);
+        res.header("Access-Control-Allow-Credentials", "true");
+        res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+        res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+        console.log(`🛰️ Preflight ${req.method} ${req.originalUrl} -> 204`);
+        return res.status(204).end();
+    }
+    next();
+});
+
 app.use(express.json());
 
 // connect to PostgreSQL
