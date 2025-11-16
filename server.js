@@ -171,10 +171,10 @@ app.post("/registration", async (req, res) => {
         const user = req.body;
         const fullName = `${user.firstName} ${user.middleName || ''} ${user.lastName}`.replace(/\s+/g, ' ').trim();
 
-        const result = await pool.query(
-          "INSERT INTO students (full_name, email, faculty_number, password, created, group) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, full_name, email, faculty_number, created",
-          [fullName, user.email, user.facultyNumber, user.password, new Date(), user.group]
-        );
+                const result = await pool.query(
+                    "INSERT INTO students (full_name, email, faculty_number, password, created, \"group\") VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, full_name, email, faculty_number, created, \"group\"",
+                    [fullName, user.email, user.facultyNumber, user.password, new Date(), user.group]
+                );
 
         const student = result.rows[0]; // inserted record without sensitive fields
         return res.send({ message: "User registration successful", student, registrationSuccess: true });
