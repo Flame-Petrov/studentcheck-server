@@ -11,6 +11,7 @@ function generateVerificationCode() {
 }
 
 async function ensureSchema(pool) {
+  console.log('[emailVerification][schema] ensuring tables/columns');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS email_verification_codes (
       id BIGSERIAL PRIMARY KEY,
@@ -24,8 +25,11 @@ async function ensureSchema(pool) {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  console.log('[emailVerification][schema] codes table ready');
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ev_email ON email_verification_codes(email);`);
+  console.log('[emailVerification][schema] index ensured');
   await pool.query(`ALTER TABLE students ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE;`);
+  console.log('[emailVerification][schema] students.email_verified ensured');
 }
 
 function validateEmail(email) {
@@ -88,6 +92,19 @@ function secondsUntil(date) {
   return Math.max(0, Math.ceil(ms / 1000));
 }
 
+function createStepLogger(context) {
+  let step = 0;
+  return (message, meta = {}) => {
+    step += 1;
+    const prefix = `[emailVerification][${context}][step ${step}]`;
+    if (Object.keys(meta).length) {
+      console.log(prefix, message, meta);
+    } else {
+      console.log(prefix, message);
+    }
+  };
+}
+
 function createEmailVerificationRouter(pool, config = {}) {
   const router = express.Router();
   const cooldownSeconds = Number(config.cooldownSeconds ?? 60);
@@ -97,17 +114,22 @@ function createEmailVerificationRouter(pool, config = {}) {
 
   router.post("/sendVerificationCode", async (req, res) => {
     try {
+      const log = createStepLogger('send');
+      log('received request', { body: req.body });
       const rawEmail = (req.body && req.body.email) || "";
       const email = String(rawEmail).trim().toLowerCase();
       if (!validateEmail(email)) {
+        log('email validation failed', { email });
         return res.status(400).send({ ok: false, error: "invalid_email" });
       }
+      log('email validated', { email });
 
       const { rows } = await pool.query(
         `SELECT * FROM email_verification_codes WHERE email = $1 AND verified = FALSE ORDER BY created_at DESC LIMIT 1`,
         [email]
       );
       const existing = rows[0];
+      log('queried existing record', { hasExisting: !!existing, existingId: existing && existing.id });
       const now = new Date();
       const ttlMs = codeTTLMinutes * 60 * 1000;
       const cooldownMs = cooldownSeconds * 1000;
@@ -119,16 +141,19 @@ function createEmailVerificationRouter(pool, config = {}) {
         const notExpired = now.getTime() < expiresAt.getTime();
         if (inCooldown) {
           const retryAfter = Math.ceil((cooldownMs - (now.getTime() - lastSentAt.getTime())) / 1000);
+          log('cooldown active; rejecting', { retryAfter });
           return res
             .status(429)
             .send({ ok: false, error: "cooldown", retryAfterSeconds: retryAfter });
         }
         if (notExpired && existing.resend_count >= maxResends) {
+          log('resend limit reached', { resend_count: existing.resend_count });
           return res.status(429).send({ ok: false, error: "resend_limit" });
         }
       }
 
       const code = generateVerificationCode();
+      log('generated code', { code });
       const expiresAt = new Date(Date.now() + ttlMs);
       const lastSentAt = now;
 
@@ -140,17 +165,21 @@ function createEmailVerificationRouter(pool, config = {}) {
            WHERE id = $1`,
           [existing.id, code, expiresAt.toISOString(), lastSentAt.toISOString()]
         );
+        log('updated existing record', { id: existing.id, newExpires: expiresAt.toISOString() });
       } else {
         await pool.query(
           `INSERT INTO email_verification_codes (email, code, expires_at, attempts, resend_count, last_sent_at, verified)
            VALUES ($1, $2, $3, 0, 0, $4, FALSE)`,
           [email, code, expiresAt.toISOString(), lastSentAt.toISOString()]
         );
+        log('inserted new record', { email, expires: expiresAt.toISOString() });
       }
 
       await sendVerificationEmail(email, code, { customSender: config.customSender });
+      log('dispatched email (or fallback)');
       return res.send({ ok: true, message: "code_sent", expiresInSeconds: secondsUntil(expiresAt) });
     } catch (err) {
+      console.error('[emailVerification][send][error]', err);
       console.error("sendVerificationCode error", err);
       return res.status(500).send({ ok: false, error: "server_error" });
     }
@@ -158,13 +187,17 @@ function createEmailVerificationRouter(pool, config = {}) {
 
   router.post("/verifyEmailCode", async (req, res) => {
     try {
+      const log = createStepLogger('verify');
+      log('received request', { body: req.body });
       const rawEmail = (req.body && req.body.email) || "";
       const rawCode = (req.body && req.body.code) || "";
       const email = String(rawEmail).trim().toLowerCase();
       const code = String(rawCode).trim();
       if (!validateEmail(email) || !/^\d{6}$/.test(code)) {
+        log('payload invalid', { email, code });
         return res.status(400).send({ ok: false, error: "invalid_payload" });
       }
+      log('payload validated', { email });
 
       const { rows } = await pool.query(
         `SELECT * FROM email_verification_codes WHERE email = $1 AND verified = FALSE ORDER BY created_at DESC LIMIT 1`,
@@ -172,16 +205,20 @@ function createEmailVerificationRouter(pool, config = {}) {
       );
       const record = rows[0];
       if (!record) {
+        log('no active record');
         return res.status(400).send({ ok: false, error: "invalid_code" });
       }
+      log('record loaded', { id: record.id, attempts: record.attempts });
 
       const now = new Date();
       const expiresAt = new Date(record.expires_at);
       if (now.getTime() > expiresAt.getTime()) {
+        log('record expired', { expiredAt: record.expires_at });
         return res.status(400).send({ ok: false, error: "expired" });
       }
 
       if (record.attempts >= maxVerifyAttempts) {
+        log('too many attempts', { attempts: record.attempts });
         return res.status(429).send({ ok: false, error: "too_many_attempts" });
       }
 
@@ -192,14 +229,17 @@ function createEmailVerificationRouter(pool, config = {}) {
           [record.id, attempts]
         );
         const remaining = Math.max(0, maxVerifyAttempts - attempts);
+        log('code mismatch', { attempts, remaining });
         return res.status(400).send({ ok: false, error: "invalid_code", attemptsRemaining: remaining });
       }
 
       await pool.query(`UPDATE email_verification_codes SET verified = TRUE WHERE id = $1`, [record.id]);
       await pool.query(`UPDATE students SET email_verified = TRUE WHERE email = $1`, [email]);
+      log('verification success', { email, recordId: record.id });
 
       return res.send({ ok: true, message: "email_verified" });
     } catch (err) {
+      console.error('[emailVerification][verify][error]', err);
       console.error("verifyEmailCode error", err);
       return res.status(500).send({ ok: false, error: "server_error" });
     }
