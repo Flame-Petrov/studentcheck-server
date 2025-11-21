@@ -4,6 +4,7 @@ const DATABASE_URL = "postgresql://postgres:***REMOVED***@DB_HOST:5432/postgres"
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg"); // PostgreSQL client
+const { createEmailVerificationRouter, ensureSchema } = require("./emailVerification");
 
 const app = express();
 
@@ -57,6 +58,9 @@ const pool = new Pool({
     const result = await client.query("SELECT NOW()");
     console.log("🕒 Server time:", result.rows[0]);
     client.release();
+
+        await ensureSchema(pool);
+        console.log("🗂️ Email verification schema ensured");
   } catch (err) {
     console.error("❌ Database connection error:", err);
   }
@@ -253,6 +257,12 @@ app.all("/heartbeat", (req, res) => {
 
 
 
+app.use("/auth", createEmailVerificationRouter(pool, {
+    cooldownSeconds: 60,
+    codeTTLMinutes: 10,
+    maxVerifyAttempts: 5,
+    maxResends: 3
+}));
 
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
