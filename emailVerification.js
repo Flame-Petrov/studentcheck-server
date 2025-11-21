@@ -142,13 +142,13 @@ function createEmailVerificationRouter(pool, config = {}) {
         if (inCooldown) {
           const retryAfter = Math.ceil((cooldownMs - (now.getTime() - lastSentAt.getTime())) / 1000);
           log('cooldown active; rejecting', { retryAfter });
-          return res
-            .status(429)
-            .send({ ok: false, error: "cooldown", retryAfterSeconds: retryAfter });
+          res.setHeader('Retry-After', retryAfter);
+          return res.status(429).send({ ok: false, error: "cooldown", retryAfterSeconds: retryAfter, message: 'Too many requests: wait before requesting a new code.' });
         }
         if (notExpired && existing.resend_count >= maxResends) {
           log('resend limit reached', { resend_count: existing.resend_count });
-          return res.status(429).send({ ok: false, error: "resend_limit" });
+          res.setHeader('Retry-After', Math.ceil((new Date(existing.expires_at).getTime() - now.getTime()) / 1000));
+          return res.status(429).send({ ok: false, error: "resend_limit", message: 'Resend limit reached for active code.' });
         }
       }
 
@@ -184,6 +184,18 @@ function createEmailVerificationRouter(pool, config = {}) {
       return res.status(500).send({ ok: false, error: "server_error" });
     }
   });
+
+  // Alias renamed endpoint for clarity
+  router.post('/requestEmailCode', async (req, res) => {
+    req.url = '/sendVerificationCode'; // reuse handler logic via rewrite
+    return router.handle(req, res);
+  });
+  // Provide helpful GET responses instead of 404 when users hit endpoint directly in browser
+  const getInfo = (path, usage) => (req, res) => {
+    res.status(405).send({ ok: false, error: 'method_not_allowed', endpoint: path, method: 'POST required', usage });
+  };
+  router.get('/sendVerificationCode', getInfo('/sendVerificationCode', 'POST JSON {"email":"user@example.com"}'));
+  router.get('/requestEmailCode', getInfo('/requestEmailCode', 'POST JSON {"email":"user@example.com"}'));
 
   router.post("/verifyEmailCode", async (req, res) => {
     try {
@@ -244,6 +256,14 @@ function createEmailVerificationRouter(pool, config = {}) {
       return res.status(500).send({ ok: false, error: "server_error" });
     }
   });
+
+  // Alias renamed verify endpoint
+  router.post('/confirmEmailCode', async (req, res) => {
+    req.url = '/verifyEmailCode';
+    return router.handle(req, res);
+  });
+  router.get('/verifyEmailCode', getInfo('/verifyEmailCode', 'POST JSON {"email":"user@example.com","code":"123456"}'));
+  router.get('/confirmEmailCode', getInfo('/confirmEmailCode', 'POST JSON {"email":"user@example.com","code":"123456"}'));
 
   return router;
 }
