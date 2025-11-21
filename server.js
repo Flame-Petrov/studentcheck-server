@@ -263,6 +263,13 @@ app.use("/auth", createEmailVerificationRouter(pool, {
     maxVerifyAttempts: 5,
     maxResends: 3
 }));
+// Backward-compatible mount for legacy frontend calling /registration/sendVerificationCode
+app.use("/registration", createEmailVerificationRouter(pool, {
+    cooldownSeconds: 60,
+    codeTTLMinutes: 10,
+    maxVerifyAttempts: 5,
+    maxResends: 3
+}));
 
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
