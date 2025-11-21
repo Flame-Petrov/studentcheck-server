@@ -35,13 +35,52 @@ function validateEmail(email) {
   return /.+@.+\..+/.test(e);
 }
 
+let cachedTransport = null;
 async function sendVerificationEmail(email, code, options = {}) {
   const { customSender } = options;
   if (typeof customSender === "function") {
     return customSender(email, code);
   }
-  console.log(`Email verification code for ${email}: ${code}`);
-  return { ok: true };
+  const host = process.env.SMTP_HOST;
+  const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 587;
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.FROM_EMAIL || user || "no-reply@example.com";
+
+  if (!host || !user || !pass) {
+    console.warn("SMTP env vars missing (SMTP_HOST, SMTP_USER, SMTP_PASS). Falling back to console log.");
+    console.log(`Email verification code for ${email}: ${code}`);
+    return { ok: true, fallback: true };
+  }
+  if (!cachedTransport) {
+    try {
+      const nodemailer = require("nodemailer");
+      cachedTransport = nodemailer.createTransport({
+        host,
+        port,
+        secure: port === 465,
+        auth: { user, pass }
+      });
+    } catch (e) {
+      console.error("Failed to init nodemailer transport; fallback to console", e);
+      console.log(`Email verification code for ${email}: ${code}`);
+      return { ok: true, fallback: true };
+    }
+  }
+  try {
+    const info = await cachedTransport.sendMail({
+      from,
+      to: email,
+      subject: "Your verification code",
+      text: `Your verification code is: ${code}\nThis code expires in 10 minutes.`,
+      html: `<p>Your verification code is: <strong>${code}</strong></p><p>This code expires in 10 minutes.</p>`
+    });
+    return { ok: true, messageId: info.messageId };
+  } catch (err) {
+    console.error("SMTP send failed; fallback to console log", err);
+    console.log(`Email verification code for ${email}: ${code}`);
+    return { ok: true, fallback: true };
+  }
 }
 
 function secondsUntil(date) {
