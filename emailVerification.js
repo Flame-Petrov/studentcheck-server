@@ -52,9 +52,8 @@ async function sendVerificationEmail(email, code, options = {}) {
   const from = process.env.FROM_EMAIL || user || "no-reply@example.com";
 
   if (!host || !user || !pass) {
-    console.warn("SMTP env vars missing (SMTP_HOST, SMTP_USER, SMTP_PASS). Falling back to console log.");
-    console.log(`Email verification code for ${email}: ${code}`);
-    return { ok: true, fallback: true };
+    console.warn("SMTP env vars missing (SMTP_HOST, SMTP_USER, SMTP_PASS). Email NOT sent.");
+    return { ok: false, error: 'smtp_not_configured' };
   }
   if (!cachedTransport) {
     try {
@@ -66,9 +65,8 @@ async function sendVerificationEmail(email, code, options = {}) {
         auth: { user, pass }
       });
     } catch (e) {
-      console.error("Failed to init nodemailer transport; fallback to console", e);
-      console.log(`Email verification code for ${email}: ${code}`);
-      return { ok: true, fallback: true };
+      console.error("Failed to init nodemailer transport", e);
+      return { ok: false, error: 'smtp_init_failed' };
     }
   }
   try {
@@ -81,9 +79,8 @@ async function sendVerificationEmail(email, code, options = {}) {
     });
     return { ok: true, messageId: info.messageId };
   } catch (err) {
-    console.error("SMTP send failed; fallback to console log", err);
-    console.log(`Email verification code for ${email}: ${code}`);
-    return { ok: true, fallback: true };
+    console.error("SMTP send failed", err);
+    return { ok: false, error: 'smtp_send_failed' };
   }
 }
 
@@ -175,8 +172,12 @@ function createEmailVerificationRouter(pool, config = {}) {
         log('inserted new record', { email, expires: expiresAt.toISOString() });
       }
 
-      await sendVerificationEmail(email, code, { customSender: config.customSender });
-      log('dispatched email (or fallback)');
+      const sendResult = await sendVerificationEmail(email, code, { customSender: config.customSender });
+      if (!sendResult.ok) {
+        log('email send failed', { error: sendResult.error });
+        return res.status(500).send({ ok: false, error: sendResult.error });
+      }
+      log('email dispatched', { messageId: sendResult.messageId });
       return res.send({ ok: true, message: "code_sent", expiresInSeconds: secondsUntil(expiresAt) });
     } catch (err) {
       console.error('[emailVerification][send][error]', err);

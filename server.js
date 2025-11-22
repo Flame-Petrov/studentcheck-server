@@ -1,5 +1,4 @@
 const PORT = process.env.PORT || 3000;
-const DATABASE_URL = "postgresql://postgres:***REMOVED***@DB_HOST:5432/postgres";
 
 const express = require("express");
 const cors = require("cors");
