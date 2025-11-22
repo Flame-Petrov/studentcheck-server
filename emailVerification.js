@@ -82,7 +82,31 @@ async function sendVerificationEmail(email, code, options = {}) {
           response: verifyErr.response
         });
         cachedTransport = null; // Force retry on next request
-        return { ok: false, error: 'smtp_verify_failed' };
+        // Fallback attempt: try STARTTLS on port 587 if 465 failed
+        console.log('[emailVerification][smtp] Trying fallback transport on port 587 (STARTTLS)...');
+        try {
+          const fallback = nodemailer.createTransport({
+            host: 'smtp.gmail.com',
+            port: 587,
+            secure: false, // STARTTLS upgrade
+            auth: { user, pass },
+            connectionTimeout: 10000,
+            socketTimeout: 15000,
+            greetingTimeout: 8000,
+            tls: { rejectUnauthorized: true }
+          });
+          console.log('[emailVerification][smtp] Verifying fallback transporter...');
+          await fallback.verify();
+          console.log('[emailVerification][smtp] Fallback transporter verified OK');
+          cachedTransport = fallback; // use fallback
+        } catch (fbErr) {
+          console.error('[emailVerification][smtp] Fallback verification failed', {
+            code: fbErr.code,
+            command: fbErr.command,
+            response: fbErr.response
+          });
+          return { ok: false, error: 'smtp_verify_failed' };
+        }
       }
     } catch (e) {
       console.error("[emailVerification][smtp] Failed to init transport", {
