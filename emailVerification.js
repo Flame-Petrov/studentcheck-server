@@ -45,33 +45,59 @@ async function sendVerificationEmail(email, code, options = {}) {
   if (typeof customSender === "function") {
     return customSender(email, code);
   }
-  const host = process.env.SMTP_HOST;
-  const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 465;
+  // Strict Gmail configuration (ignore provided host/port envs except auth)
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
   const from = process.env.FROM_EMAIL || user || "no-reply@example.com";
 
-  if (!host || !user || !pass) {
-    console.warn("SMTP env vars missing (SMTP_HOST, SMTP_USER, SMTP_PASS). Email NOT sent.");
+  if (!user || !pass) {
+    console.warn("[emailVerification][smtp] Missing SMTP_USER / SMTP_PASS. Cannot send email.");
     return { ok: false, error: 'smtp_not_configured' };
   }
+
   if (!cachedTransport) {
+    console.log("[emailVerification][smtp] Attempting SMTP connection...");
+    console.log("[emailVerification][smtp] Using host smtp.gmail.com port 465 secure true user", user);
     try {
       const nodemailer = require("nodemailer");
       cachedTransport = nodemailer.createTransport({
-        host,
-        port,
-        secure: true, // Force SSL for Gmail on Port 465
+        host: 'smtp.gmail.com',
+        port: 465,
+        secure: true,
         auth: { user, pass },
-        // Add this request timeout to prevent hanging forever
-        connectionTimeout: 10000, 
+        connectionTimeout: 10000,
+        // Optional additional timeouts for Gmail reliability
+        socketTimeout: 15000,
+        greetingTimeout: 8000
       });
+      // Verify immediately
+      console.log("[emailVerification][smtp] Verifying transporter...");
+      try {
+        await cachedTransport.verify();
+        console.log("[emailVerification][smtp] Transport verified OK");
+      } catch (verifyErr) {
+        console.error("[emailVerification][smtp] Transport verification failed", {
+          code: verifyErr.code,
+          command: verifyErr.command,
+          response: verifyErr.response
+        });
+        cachedTransport = null; // Force retry on next request
+        return { ok: false, error: 'smtp_verify_failed' };
+      }
     } catch (e) {
-      console.error("Failed to init nodemailer transport", e);
+      console.error("[emailVerification][smtp] Failed to init transport", {
+        message: e.message,
+        code: e.code,
+        command: e.command,
+        response: e.response
+      });
+      cachedTransport = null;
       return { ok: false, error: 'smtp_init_failed' };
     }
   }
+
   try {
+    console.log("[emailVerification][smtp] Sending email...");
     const info = await cachedTransport.sendMail({
       from,
       to: email,
@@ -79,9 +105,20 @@ async function sendVerificationEmail(email, code, options = {}) {
       text: `Your verification code is: ${code}\nThis code expires in 10 minutes.`,
       html: `<p>Your verification code is: <strong>${code}</strong></p><p>This code expires in 10 minutes.</p>`
     });
+    console.log("[emailVerification][smtp] Email sent", { messageId: info.messageId, accepted: info.accepted, rejected: info.rejected });
     return { ok: true, messageId: info.messageId };
   } catch (err) {
-    console.error("SMTP send failed", err);
+    console.error("[emailVerification][smtp] Send failed", {
+      message: err.message,
+      code: err.code,
+      command: err.command,
+      response: err.response
+    });
+    // If timeout or connection issue, discard transport to allow recreate
+    if (err.code === 'ETIMEDOUT' || err.code === 'ECONNECTION' || err.code === 'EAUTH') {
+      cachedTransport = null;
+      console.log("[emailVerification][smtp] Transport cleared due to error; will recreate next attempt");
+    }
     return { ok: false, error: 'smtp_send_failed' };
   }
 }
