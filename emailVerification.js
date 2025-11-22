@@ -46,7 +46,7 @@ async function sendVerificationEmail(email, code, options = {}) {
     return customSender(email, code);
   }
   const host = process.env.SMTP_HOST;
-  const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 587;
+  const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 465;
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
   const from = process.env.FROM_EMAIL || user || "no-reply@example.com";
