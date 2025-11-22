@@ -61,8 +61,10 @@ async function sendVerificationEmail(email, code, options = {}) {
       cachedTransport = nodemailer.createTransport({
         host,
         port,
-        secure: port === 465,
-        auth: { user, pass }
+        secure: true, // Force SSL for Gmail on Port 465
+        auth: { user, pass },
+        // Add this request timeout to prevent hanging forever
+        connectionTimeout: 10000, 
       });
     } catch (e) {
       console.error("Failed to init nodemailer transport", e);
