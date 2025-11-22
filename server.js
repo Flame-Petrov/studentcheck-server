@@ -56,6 +56,22 @@ const pool = new Pool({
     console.log("✅ Connected to PostgreSQL!");
     const result = await client.query("SELECT NOW()");
     console.log("🕒 Server time:", result.rows[0]);
+        // --- Ensure required tables exist (idempotent) ---
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS classes (
+                id SERIAL PRIMARY KEY,
+                teacher_id INTEGER NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS attendances (
+                id SERIAL PRIMARY KEY,
+                class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                timestamp TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(class_id, student_id)
+            );
+        `);
+        console.log("🛠️ Verified tables: classes, attendances");
     client.release();
   } catch (err) {
     console.error("❌ Database connection error:", err);
@@ -229,6 +245,147 @@ app.get("/students", async (req, res) => {
     result = result.rows;
     // console.log('Processed result:', result);
     res.send({message: "Students endpoint reached", students: result });
+});
+
+
+// ----------------- Class Creation Endpoint -----------------
+// Expects body: { name: string, teacherEmail?: string }
+// Authentication placeholder: teacher identified by provided email (until token/session implemented)
+app.post("/classes", async (req, res) => {
+    console.log();
+    console.log("Received POST /classes");
+    const { name, teacherEmail } = req.body || {};
+
+    if (!name) {
+        return res.status(400).send({ error: "Class name is required" });
+    }
+    if (!teacherEmail) {
+        return res.status(400).send({ error: "Teacher email is required for now" });
+    }
+
+    try {
+        const teacherResult = await pool.query("SELECT id, email, full_name FROM teachers WHERE email = $1", [teacherEmail]);
+        if (teacherResult.rows.length === 0) {
+            return res.status(404).send({ error: "Teacher not found" });
+        }
+        const teacherId = teacherResult.rows[0].id;
+
+        const insertResult = await pool.query(
+            "INSERT INTO classes (teacher_id, name) VALUES ($1, $2) RETURNING id, teacher_id, name",
+            [teacherId, name]
+        );
+
+        const created = insertResult.rows[0];
+        res.status(201).send({ message: "Class created", class: created });
+    } catch (error) {
+        console.error("❌ Database error creating class:", error);
+        res.status(500).send({ error: "Internal server error" });
+    }
+});
+
+// (Optional helper) List classes for a teacher by email query param: /classes?teacherEmail=...
+app.get("/classes", async (req, res) => {
+    console.log();
+    console.log("Received GET /classes");
+    const { teacherEmail } = req.query;
+    try {
+        if (teacherEmail) {
+            const t = await pool.query("SELECT id FROM teachers WHERE email = $1", [teacherEmail]);
+            if (t.rows.length === 0) {
+                return res.status(404).send({ error: "Teacher not found" });
+            }
+            const teacherId = t.rows[0].id;
+            const classes = await pool.query("SELECT id, teacher_id, name FROM classes WHERE teacher_id = $1 ORDER BY id DESC", [teacherId]);
+            return res.send({ message: "Classes fetched", classes: classes.rows });
+        } else {
+            const classes = await pool.query("SELECT id, teacher_id, name FROM classes ORDER BY id DESC");
+            return res.send({ message: "All classes fetched", classes: classes.rows });
+        }
+    } catch (error) {
+        console.error("❌ Database error fetching classes:", error);
+        res.status(500).send({ error: "Internal server error" });
+    }
+});
+
+// ----------------- Attendance Recording Endpoint -----------------
+// Expects body: { classId: number, studentId: number }
+app.post("/attendance", async (req, res) => {
+    console.log();
+    console.log("Received POST /attendance");
+    const { classId, studentId } = req.body || {};
+
+    if (!classId || !studentId) {
+        return res.status(400).send({ error: "classId and studentId are required" });
+    }
+
+    try {
+        // Validate class
+        const classResult = await pool.query("SELECT id FROM classes WHERE id = $1", [classId]);
+        if (classResult.rows.length === 0) {
+            return res.status(404).send({ error: "Class not found" });
+        }
+
+        // Validate student
+        const studentResult = await pool.query("SELECT id FROM students WHERE id = $1", [studentId]);
+        if (studentResult.rows.length === 0) {
+            return res.status(404).send({ error: "Student not found" });
+        }
+
+        // Prevent duplicate
+        const duplicateCheck = await pool.query(
+            "SELECT id FROM attendances WHERE class_id = $1 AND student_id = $2",
+            [classId, studentId]
+        );
+        if (duplicateCheck.rows.length > 0) {
+            return res.status(409).send({ error: "Attendance already recorded", attendanceId: duplicateCheck.rows[0].id });
+        }
+
+        const insertAttendance = await pool.query(
+            "INSERT INTO attendances (class_id, student_id) VALUES ($1, $2) RETURNING id, class_id, student_id, timestamp",
+            [classId, studentId]
+        );
+
+        res.status(201).send({ message: "Attendance recorded", attendance: insertAttendance.rows[0] });
+    } catch (error) {
+        console.error("❌ Database error recording attendance:", error);
+        res.status(500).send({ error: "Internal server error" });
+    }
+});
+
+// List attendance entries optionally filtered by classId: /attendance?classId=...
+app.get("/attendance", async (req, res) => {
+    console.log();
+    console.log("Received GET /attendance");
+    const { classId } = req.query;
+    try {
+        if (classId) {
+            const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classId]);
+            if (classCheck.rows.length === 0) {
+                return res.status(404).send({ error: "Class not found" });
+            }
+            const rows = await pool.query(`
+                SELECT a.id, a.class_id, a.student_id, a.timestamp,
+                             s.full_name AS student_name
+                FROM attendances a
+                JOIN students s ON a.student_id = s.id
+                WHERE a.class_id = $1
+                ORDER BY a.timestamp DESC
+            `, [classId]);
+            return res.send({ message: "Attendance fetched", attendance: rows.rows });
+        }
+        const rows = await pool.query(`
+            SELECT a.id, a.class_id, a.student_id, a.timestamp,
+                         s.full_name AS student_name, c.name AS class_name
+            FROM attendances a
+            JOIN students s ON a.student_id = s.id
+            JOIN classes c ON a.class_id = c.id
+            ORDER BY a.timestamp DESC
+        `);
+        return res.send({ message: "All attendance fetched", attendance: rows.rows });
+    } catch (error) {
+        console.error("❌ Database error fetching attendance:", error);
+        res.status(500).send({ error: "Internal server error" });
+    }
 });
 
 
