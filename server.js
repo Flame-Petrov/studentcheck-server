@@ -284,7 +284,7 @@ app.post("/classes", async (req, res) => {
 
         console.log("Class inserted:", created);
         res.status(201).send({ message: "Class created", class: created });
-        
+
     } catch (error) {
         console.error("❌ Database error creating class:", error);
         res.status(500).send({ error: "Internal server error" });
@@ -295,6 +295,7 @@ app.post("/classes", async (req, res) => {
 app.get("/classes", async (req, res) => {
     console.log();
     console.log("Received GET /classes");
+    console.log("Query params:", req.query);
     const { teacherEmail } = req.query;
     try {
         if (teacherEmail) {
@@ -303,7 +304,9 @@ app.get("/classes", async (req, res) => {
                 return res.status(404).send({ error: "Teacher not found" });
             }
             const teacherId = t.rows[0].id;
+            console.log("Fetching classes for teacher ID:", teacherId);
             const classes = await pool.query("SELECT id, teacher_id, name FROM classes WHERE teacher_id = $1 ORDER BY id DESC", [teacherId]);
+            console.log("Classes fetched:", classes.rows);
             return res.send({ message: "Classes fetched", classes: classes.rows });
         } else {
             const classes = await pool.query("SELECT id, teacher_id, name FROM classes ORDER BY id DESC");
