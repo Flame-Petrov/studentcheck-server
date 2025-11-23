@@ -254,12 +254,16 @@ app.get("/students", async (req, res) => {
 app.post("/classes", async (req, res) => {
     console.log();
     console.log("Received POST /classes");
+    console.log("Request body:", req.body);
+
     const { name, teacherEmail } = req.body || {};
 
     if (!name) {
+        console.log("Class name is missing in request");
         return res.status(400).send({ error: "Class name is required" });
     }
     if (!teacherEmail) {
+        console.log("Teacher email is missing in request");
         return res.status(400).send({ error: "Teacher email is required for now" });
     }
 
@@ -269,6 +273,7 @@ app.post("/classes", async (req, res) => {
             return res.status(404).send({ error: "Teacher not found" });
         }
         const teacherId = teacherResult.rows[0].id;
+        console.log("Teacher ID found:", teacherId);    
 
         const insertResult = await pool.query(
             "INSERT INTO classes (teacher_id, name) VALUES ($1, $2) RETURNING id, teacher_id, name",
@@ -276,7 +281,10 @@ app.post("/classes", async (req, res) => {
         );
 
         const created = insertResult.rows[0];
+
+        console.log("Class inserted:", created);
         res.status(201).send({ message: "Class created", class: created });
+        
     } catch (error) {
         console.error("❌ Database error creating class:", error);
         res.status(500).send({ error: "Internal server error" });
