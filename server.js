@@ -305,8 +305,10 @@ app.get("/classes", async (req, res) => {
             }
             const teacherId = t.rows[0].id;
             console.log("Fetching classes for teacher ID:", teacherId);
+
             const classes = await pool.query("SELECT id, teacher_id, name FROM classes WHERE teacher_id = $1 ORDER BY id DESC", [teacherId]);
             console.log("Classes fetched:", classes.rows);
+            
             return res.send({ message: "Classes fetched", classes: classes.rows });
         } else {
             const classes = await pool.query("SELECT id, teacher_id, name FROM classes ORDER BY id DESC");
