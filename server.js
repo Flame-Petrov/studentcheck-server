@@ -323,9 +323,16 @@ app.get("/classes", async (req, res) => {
 
 
 app.post("/class_students", async (req, res) => {
+    
     console.log();
     console.log('Received POST /class_students');
     console.log('Request body:', req.body);
+
+    var className = req.body.class_name;
+    var studentIds = req.body.student_ids; // expect array of student IDs
+
+    console.log("className:", className);
+    console.log("studentIds:", studentIds);
 
 });
 
