@@ -324,10 +324,10 @@ app.get("/class_students", async (req, res) => {
     console.log();
     console.log('Received GET /class_students');
     console.log("Query params:", req.query);
-    var classId = req.query.classId;
+    var classId = req.query.class_id;
     console.log("classId:", classId);
     if (!classId) {
-        return res.status(400).send({ error: "classId query parameter is required" });
+        return res.status(400).send({ error: "class_id query parameter is required" });
     }
     var result  = await pool.query("SELECT * FROM class_students WHERE class_id = $1", [classId]);
     console.log('Query result:', result.rows);
