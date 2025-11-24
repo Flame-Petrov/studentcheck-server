@@ -320,6 +320,28 @@ app.get("/classes", async (req, res) => {
     }
 });
 
+app.get("/class_students", async (req, res) => {
+    console.log();
+    console.log('Received GET /class_students');
+    console.log("Query params:", req.query);
+    var classId = req.query.classId;
+    if (!classId) {
+        return res.status(400).send({ error: "classId query parameter is required" });
+    }
+    var result  = await pool.query("SELECT * FROM class_students WHERE class_id = $1", [classId]);
+    console.log('Query result:', result.rows);
+    // var result = await pool.query(`
+    //     SELECT c.id AS class_id, c.name AS class_name,
+    //            s.id AS student_id, s.full_name AS student_name, s.faculty_number
+    //     FROM classes c
+    //     JOIN attendances a ON c.id = a.class_id
+    //     JOIN students s ON a.student_id = s.id
+    //     ORDER BY c.id, s.full_name
+    // `);
+    // result = result.rows;
+    // res.send({message: "Class students fetched", class_students: result });
+});
+
 // ----------------- Attendance Recording Endpoint -----------------
 // Expects body: { classId: number, studentId: number }
 app.post("/attendance", async (req, res) => {
