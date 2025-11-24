@@ -320,6 +320,18 @@ app.get("/classes", async (req, res) => {
     }
 });
 
+
+
+app.post("/class_students", async (req, res) => {
+    console.log();
+    console.log('Received POST /class_students');
+    console.log('Request body:', req.body);
+
+});
+
+
+
+
 app.get("/class_students", async (req, res) => {
     console.log();
     console.log('Received GET /class_students');
@@ -342,6 +354,14 @@ app.get("/class_students", async (req, res) => {
     // result = result.rows;
     // res.send({message: "Class students fetched", class_students: result });
 });
+
+
+
+
+
+
+
+
 
 // ----------------- Attendance Recording Endpoint -----------------
 // Expects body: { classId: number, studentId: number }
