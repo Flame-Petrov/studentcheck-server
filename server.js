@@ -325,6 +325,7 @@ app.get("/class_students", async (req, res) => {
     console.log('Received GET /class_students');
     console.log("Query params:", req.query);
     var classId = req.query.classId;
+    console.log("classId:", classId);
     if (!classId) {
         return res.status(400).send({ error: "classId query parameter is required" });
     }
