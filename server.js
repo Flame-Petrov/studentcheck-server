@@ -336,13 +336,17 @@ app.post("/class_students", async (req, res) => {
     console.log("classId:", classId);
 
     console.log("Extracting student IDs using faculty numbers from Database...");
-    students.forEach(async student => {
-        console.log("Processing student:", student);
-        const studentId = await pool.query("SELECT id FROM students WHERE faculty_number = $1", [student.facultyNumber]);
-        studentIds.push(studentId.rows[0].id);
+
+    var facultyNumbers = students.map(s => s.facultyNumber).filter(Boolean);
+    var placeholders = facultyNumbers.map((_, i) => `$${i + 1}`).join(',');
+    var sql = `SELECT id, faculty_number FROM students WHERE faculty_number IN (${placeholders})`;
+    var result = await pool.query(sql, facultyNumbers);
+    var idMap = {};
+    result.rows.forEach(row => {
+        idMap[row.faculty_number] = row.id;
     });
 
-    console.log("studentIds:", studentIds);
+    console.log("idMap:", idMap);
 
 });
 
