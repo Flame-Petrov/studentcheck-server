@@ -330,38 +330,51 @@ app.post("/class_students", async (req, res) => {
 
     var classId = req.body.classId;
     var students = req.body.students; // array of student
-    
-    var studentIds = [];
 
     console.log("classId:", classId);
 
     console.log("Extracting student IDs using faculty numbers from Database...");
+    try{
+        var facultyNumbers = students.map(s => s.facultyNumber).filter(Boolean);
+        console.log("facultyNumbers:", facultyNumbers);
 
-    var facultyNumbers = students.map(s => s.facultyNumber).filter(Boolean);
-    console.log("facultyNumbers:", facultyNumbers);
+        var placeholders = facultyNumbers.map((_, i) => `$${i + 1}`).join(',');
+        console.log("placeholders:", placeholders);
 
-    var placeholders = facultyNumbers.map((_, i) => `$${i + 1}`).join(',');
-    console.log("placeholders:", placeholders);
+        var sql = `SELECT id, faculty_number FROM students WHERE faculty_number IN (${placeholders})`;
+        console.log("SQL:", sql);
 
-    var sql = `SELECT id, faculty_number FROM students WHERE faculty_number IN (${placeholders})`;
-    console.log("SQL:", sql);
+        var result = await pool.query(sql, facultyNumbers);
 
-    var result = await pool.query(sql, facultyNumbers);
+        var idMap = {};
+        result.rows.forEach(row => {
+            idMap[row.id] = row.faculty_number;
+        });
+        
+        var sqlInsert = "INSERT INTO class_students (class_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
+        Object.keys(idMap).forEach(id => {
+            console.log("Student ID:", id, "Faculty Number:", idMap[id]);
+            pool.query(sqlInsert, [classId, id]);
+        });
 
-    var idMap = {};
-    result.rows.forEach(row => {
-        idMap[row.id] = row.faculty_number;
-    });
+        console.log("Students successfully added to class.");
+
+        res.send({ message: "Students added to class successfully" });
+
+    }catch(error){
+        var errorMessage;
+        if(error.type === 'TypeError'){
+            errorMessage = "No students provided to be added to the database.";
+            console.error(errorMessage);
+        }else{
+            console.error("Error extracting student IDs:", error);
+        }
+
+        res.send({ message: "Error on adding students to class (database error)" });
+    }
     
-    var sqlInsert = "INSERT INTO class_students (class_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
-    Object.keys(idMap).forEach(id => {
-        console.log("Student ID:", id, "Faculty Number:", idMap[id]);
-        pool.query(sqlInsert, [classId, id]);
-    });
 
-    console.log("Students successfully added to class.");
-
-    res.send({ message: "Students added to class successfully" });
+    
 });
 
 
