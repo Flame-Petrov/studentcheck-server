@@ -360,7 +360,7 @@ app.post("/class_students", async (req, res) => {
     });
 
     console.log("Students successfully added to class.");
-    
+
     res.send({ message: "Students added to class successfully" });
 });
 
@@ -380,7 +380,32 @@ app.get("/class_students", async (req, res) => {
     }
     var result  = await pool.query("SELECT * FROM class_students WHERE class_id = $1", [classId]);
     console.log('Query result:', result.rows);
-    return res.send({message: "Class students fetched", students: result.rows });
+
+    // get student details for each student_id
+    var studentIds = [];
+    result.rows.forEach(row => {
+        var studentId = row.student_id;
+        console.log("Student ID in class:", studentId);
+        studentIds.push(studentId);
+    });
+
+    console.log("Student IDs in class:", studentIds);
+
+    // Fetch details for these students
+    let studentsDetails = [];
+    if (studentIds.length > 0) {
+        const placeholders = studentIds.map((_, i) => `$${i + 1}`).join(',');
+        const sql = `SELECT id, full_name, faculty_number FROM students WHERE id IN (${placeholders})`;
+        const detailsRes = await pool.query(sql, studentIds);
+        studentsDetails = detailsRes.rows;
+    }
+
+    console.log("Students details fetched:", studentsDetails);
+
+    return res.send({
+        message: "Class students fetched",
+        students: studentsDetails // add names and faculty numbers by id
+    });
 });
 
 
