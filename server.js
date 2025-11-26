@@ -350,7 +350,7 @@ app.get("/class_students", async (req, res) => {
     }
     var result  = await pool.query("SELECT * FROM class_students WHERE class_id = $1", [classId]);
     console.log('Query result:', result.rows);
-    return res.send({message: "Class students fetched", class_students: result.rows });
+    return res.send({message: "Class students fetched", students: result.rows });
 });
 
 
