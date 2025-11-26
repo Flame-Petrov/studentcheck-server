@@ -338,9 +338,16 @@ app.post("/class_students", async (req, res) => {
     console.log("Extracting student IDs using faculty numbers from Database...");
 
     var facultyNumbers = students.map(s => s.facultyNumber).filter(Boolean);
+    console.log("facultyNumbers:", facultyNumbers);
+
     var placeholders = facultyNumbers.map((_, i) => `$${i + 1}`).join(',');
+    console.log("placeholders:", placeholders);
+
     var sql = `SELECT id, faculty_number FROM students WHERE faculty_number IN (${placeholders})`;
+    console.log("SQL:", sql);
+
     var result = await pool.query(sql, facultyNumbers);
+    
     var idMap = {};
     result.rows.forEach(row => {
         idMap[row.faculty_number] = row.id;
