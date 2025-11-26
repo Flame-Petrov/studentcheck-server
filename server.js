@@ -347,14 +347,21 @@ app.post("/class_students", async (req, res) => {
     console.log("SQL:", sql);
 
     var result = await pool.query(sql, facultyNumbers);
-    
+
     var idMap = {};
     result.rows.forEach(row => {
-        idMap[row.faculty_number] = row.id;
+        idMap[row.id] = row.faculty_number;
+    });
+    
+    var sqlInsert = "INSERT INTO class_students (class_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
+    Object.keys(idMap).forEach(id => {
+        console.log("Student ID:", id, "Faculty Number:", idMap[id]);
+        pool.query(sqlInsert, [classId, id]);
     });
 
-    console.log("idMap:", idMap);
-
+    console.log("Students successfully added to class.");
+    
+    res.send({ message: "Students added to class successfully" });
 });
 
 
