@@ -330,11 +330,18 @@ app.post("/class_students", async (req, res) => {
 
     var classId = req.body.classId;
     var students = req.body.students; // array of student
+    
+    var studentIds = [];
 
     console.log("classId:", classId);
-    students.forEach(student => {
-        console.log("Adding student:", student);
+
+    console.log("Extracting student IDs using faculty numbers from Database...");
+    students.forEach(async student => {
+        const studentId = await pool.query("SELECT id FROM students WHERE faculty_number = $1", [student.facultyNumber]);
+        studentIds.push(studentId.rows[0].id);
     });
+
+    console.log("studentIds:", studentIds);
 
 });
 
