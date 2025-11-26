@@ -323,7 +323,7 @@ app.get("/classes", async (req, res) => {
 
 
 app.post("/class_students", async (req, res) => {
-    
+
     console.log();
     console.log('Received POST /class_students');
     console.log('Request body:', req.body);
@@ -350,16 +350,7 @@ app.get("/class_students", async (req, res) => {
     }
     var result  = await pool.query("SELECT * FROM class_students WHERE class_id = $1", [classId]);
     console.log('Query result:', result.rows);
-    // var result = await pool.query(`
-    //     SELECT c.id AS class_id, c.name AS class_name,
-    //            s.id AS student_id, s.full_name AS student_name, s.faculty_number
-    //     FROM classes c
-    //     JOIN attendances a ON c.id = a.class_id
-    //     JOIN students s ON a.student_id = s.id
-    //     ORDER BY c.id, s.full_name
-    // `);
-    // result = result.rows;
-    // res.send({message: "Class students fetched", class_students: result });
+    return res.send({message: "Class students fetched", class_students: result.rows });
 });
 
 
