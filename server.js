@@ -335,7 +335,7 @@ app.post("/class_students", async (req, res) => {
 
     console.log("Extracting student IDs using faculty numbers from Database...");
     try{
-        var facultyNumbers = students.map(s => s.facultyNumber).filter(Boolean);
+        var facultyNumbers = students.map(s => s.facultyNumber || s.faculty_number).filter(Boolean);
         console.log("facultyNumbers:", facultyNumbers);
 
         var placeholders = facultyNumbers.map((_, i) => `$${i + 1}`).join(',');
