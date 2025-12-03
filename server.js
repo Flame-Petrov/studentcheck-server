@@ -168,12 +168,7 @@ app.post("/studentLogin", async (req, res) => {
             const student = result.rows[0];
             res.send({ 
                 message: "Student login successful", 
-                student: {
-                    id: student.id,
-                    facultyNumber: student.faculty_number,
-                    fullName: student.full_name,
-                    email: student.email
-                },
+                student: student,
                 loginSuccess: true
             });
         } else {
@@ -427,7 +422,7 @@ app.get("/class_students", async (req, res) => {
 
 
 app.get("/get_student_classes", async (req, res) => {
-    
+
     console.log();
     console.log('Received GET /get_student_classes');
     console.log("Query params:", req.query);
@@ -442,7 +437,7 @@ app.get("/get_student_classes", async (req, res) => {
 
     return res.send({
         message: "Student classes fetched",
-        classes: result.rows
+        class_students: result.rows
     });
 
 });
