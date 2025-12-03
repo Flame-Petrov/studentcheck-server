@@ -448,6 +448,15 @@ app.post("/attendance", async (req, res) => {
 
     try {
 
+        const classIdNum = Number(classId);
+        const studentIdsInt = studentIds
+            .map(value => Number(value))
+            .filter(Number.isFinite);
+
+        if (studentIdsInt.length === 0) {
+            return res.status(400).send({ error: "No valid studentIds provided" });
+        }
+
         const upsertSql = `
             INSERT INTO attendances (class_id, student_id)
             SELECT $1 AS class_id, UNNEST($2::int[]) AS student_id
@@ -462,7 +471,7 @@ app.post("/attendance", async (req, res) => {
         
         for (const studentId of studentIds) {
             console.log(`Recording attendance for classId: ${classId}, studentId: ${studentId}`);
-            const { rows } = await pool.query(upsertSql, [classId, studentId]);
+            const { rows } = await pool.query(upsertSql, [classIdNum, studentIdsInt]);
             results.push(rows[0]);
         }
 
