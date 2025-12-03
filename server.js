@@ -453,10 +453,11 @@ app.post("/attendance", async (req, res) => {
 
         const results = [];
         for (const studentId of studentIds) {
+            console.log(`Recording attendance for classId: ${classId}, studentId: ${studentId}`);
             const { rows } = await pool.query(upsertSql, [classId, studentId]);
             results.push(rows[0]);
         }
-        
+
         console.log("Attendance results:", results);
 
         res.status(201).send({ message: "Attendance processed", attendance: results });
