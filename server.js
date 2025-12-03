@@ -490,16 +490,21 @@ app.post("/attendance", async (req, res) => {
 app.get("/attendance", async (req, res) => {
     console.log();
     console.log("Received GET /attendance");
-    const { classId } = req.query;
+    console.log("Query params:", req.query);
+    
+    const classId = req.query.class_id;
+    const studentId = req.query.student_id;
+
     try {
         if (classId) {
+
             const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classId]);
             if (classCheck.rows.length === 0) {
                 return res.status(404).send({ error: "Class not found" });
             }
+
             const rows = await pool.query(`
-                SELECT a.id, a.class_id, a.student_id, a.timestamp,
-                             s.full_name AS student_name
+                SELECT a.id, a.class_id, a.student_id, a.count, s.full_name AS student_name
                 FROM attendances a
                 JOIN students s ON a.student_id = s.id
                 WHERE a.class_id = $1
@@ -507,6 +512,8 @@ app.get("/attendance", async (req, res) => {
             `, [classId]);
             return res.send({ message: "Attendance fetched", attendance: rows.rows });
         }
+
+        
         const rows = await pool.query(`
             SELECT a.id, a.class_id, a.student_id, a.timestamp,
                          s.full_name AS student_name, c.name AS class_name
