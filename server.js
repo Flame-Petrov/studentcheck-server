@@ -426,6 +426,29 @@ app.get("/class_students", async (req, res) => {
 
 
 
+app.get("/get_student_classes", async (req, res) => {
+    
+    console.log();
+    console.log('Received GET /get_student_classes');
+    console.log("Query params:", req.query);
+
+    var studentId = req.query.student_id;;
+    console.log("studentId:", studentId);
+
+    const sql = `SELECT * FROM class_students WHERE student_id = $1`;
+    const result  = await pool.query(sql, [studentId]);
+
+    console.log('Query result:', result.rows);
+
+    return res.send({
+        message: "Student classes fetched",
+        classes: result.rows
+    });
+
+});
+
+
+
 
 
 
