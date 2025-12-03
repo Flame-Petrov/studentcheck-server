@@ -435,7 +435,9 @@ app.post("/attendance", async (req, res) => {
     console.log();
     console.log("Received POST /attendance");
     console.log("Request body:", req.body);
-    const { classId, studentIds } = req.body;
+    
+    const classId = req.body.class_id;
+    const studentIds = req.body.student_ids; // expect array of student IDs
 
     console.log("classId:", classId);
     console.log("studentIds:", studentIds);
