@@ -453,15 +453,17 @@ app.post("/attendance", async (req, res) => {
             .map(value => Number(value))
             .filter(Number.isFinite);
 
+        const uniqueIds = Array.from(new Set(studentIdsInt));
+
         if (studentIdsInt.length === 0) {
             return res.status(400).send({ error: "No valid studentIds provided" });
         }
 
         const upsertSql = `
             INSERT INTO attendances (class_id, student_id)
-            SELECT $1 AS class_id, UNNEST($2::int[]) AS student_id
+            VALUES ($1, $2)
             ON CONFLICT (class_id, student_id)
-            DO UPDATE SET count = attendances.count + 1
+            DO UPDATE SET count = COALESCE(attendances.count, 0) + 1
             RETURNING id, class_id, student_id, count
         `;
 
@@ -469,9 +471,9 @@ app.post("/attendance", async (req, res) => {
 
         console.log("Processing attendance for student IDs:", studentIds);
         
-        for (const studentId of studentIds) {
+        for (const studentId of uniqueIds) {
             console.log(`Recording attendance for classId: ${classId}, studentId: ${studentId}`);
-            const { rows } = await pool.query(upsertSql, [classIdNum, studentIdsInt]);
+            const { rows } = await pool.query(upsertSql, [classIdNum, studentId]);
             results.push(rows[0]);
         }
 
