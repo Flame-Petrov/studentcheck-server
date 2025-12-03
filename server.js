@@ -435,20 +435,34 @@ app.get("/get_student_classes", async (req, res) => {
 
     console.log('Query result:', result.rows);
 
+
+
+
+
+    // Collect unique class IDs from result rows
+    const classIds = Array.from(new Set(result.rows.map(row => Number(row.class_id)).filter(Boolean)));
+
     let classNames = [];
 
-    result.rows.forEach(row => {
-        console.log("Class ID for student:", row.class_id);
-        console.log("Type of row.class_id:", typeof row.class_id);
-        const nameResult = pool.query("SELECT name FROM classes WHERE id = $1", [row.class_id]);
-        if(nameResult.rows.length > 0){
-            const className = nameResult.rows[0].name;
-            console.log("Class name:", className);
-            classNames.push(className);
-        }
-    });
+    if (classIds.length > 0) {
+        const placeholders = classIds.map((_, i) => `$${i + 1}`).join(',');
+        const sql = `SELECT id, name FROM classes WHERE id IN (${placeholders})`;
+        const { rows: classRows } = await pool.query(sql, classIds);
 
-    console.log("Class names:", classNames ,"for student:", studentId);
+        // Build id -> name map
+        const nameById = new Map(classRows.map(row => [Number(row.id), row.name]));
+
+        // Preserve original order if needed
+        classNames = result.rows
+            .map(row => nameById.get(Number(row.class_id)))
+            .filter(Boolean);
+    }
+
+
+
+
+
+    console.log("Class names:", classNames);
 
     return res.send({
         message: "Student classes fetched",
