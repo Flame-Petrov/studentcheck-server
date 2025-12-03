@@ -435,7 +435,10 @@ app.post("/attendance", async (req, res) => {
     console.log();
     console.log("Received POST /attendance");
     console.log("Request body:", req.body);
-    const { classId, studentIds } = req.body || {};
+    const { classId, studentIds } = req.body;
+
+    console.log("classId:", classId);
+    console.log("studentIds:", studentIds);
 
     if (!classId || !studentIds) {
         return res.status(400).send({ error: "classId and studentIds are required" });
@@ -452,6 +455,9 @@ app.post("/attendance", async (req, res) => {
         `;
 
         const results = [];
+
+        console.log("Processing attendance for student IDs:", studentIds);
+        
         for (const studentId of studentIds) {
             console.log(`Recording attendance for classId: ${classId}, studentId: ${studentId}`);
             const { rows } = await pool.query(upsertSql, [classId, studentId]);
