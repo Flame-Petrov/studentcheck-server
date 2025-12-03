@@ -439,6 +439,7 @@ app.get("/get_student_classes", async (req, res) => {
 
     result.rows.forEach(row => {
         console.log("Class ID for student:", row.class_id);
+        console.log("Type of row.class_id:", typeof row.class_id);
         const nameResult = pool.query("SELECT name FROM classes WHERE id = $1", [row.class_id]);
         if(nameResult.rows.length > 0){
             const className = nameResult.rows[0].name;
