@@ -434,40 +434,32 @@ app.get("/class_students", async (req, res) => {
 app.post("/attendance", async (req, res) => {
     console.log();
     console.log("Received POST /attendance");
-    const { classId, studentId } = req.body || {};
+    console.log("Request body:", req.body);
+    const { classId, studentIds } = req.body || {};
 
-    if (!classId || !studentId) {
-        return res.status(400).send({ error: "classId and studentId are required" });
+    if (!classId || !studentIds) {
+        return res.status(400).send({ error: "classId and studentIds are required" });
     }
 
     try {
-        // Validate class
-        const classResult = await pool.query("SELECT id FROM classes WHERE id = $1", [classId]);
-        if (classResult.rows.length === 0) {
-            return res.status(404).send({ error: "Class not found" });
+
+        const upsertSql = `
+            INSERT INTO attendances (class_id, student_id)
+            SELECT $1 AS class_id, UNNEST($2::int[]) AS student_id
+            ON CONFLICT (class_id, student_id)
+            DO UPDATE SET count = attendances.count + 1
+            RETURNING id, class_id, student_id, count
+        `;
+
+        const results = [];
+        for (const studentId of studentIds) {
+            const { rows } = await pool.query(upsertSql, [classId, studentId]);
+            results.push(rows[0]);
         }
+        
+        console.log("Attendance results:", results);
 
-        // Validate student
-        const studentResult = await pool.query("SELECT id FROM students WHERE id = $1", [studentId]);
-        if (studentResult.rows.length === 0) {
-            return res.status(404).send({ error: "Student not found" });
-        }
-
-        // Prevent duplicate
-        const duplicateCheck = await pool.query(
-            "SELECT id FROM attendances WHERE class_id = $1 AND student_id = $2",
-            [classId, studentId]
-        );
-        if (duplicateCheck.rows.length > 0) {
-            return res.status(409).send({ error: "Attendance already recorded", attendanceId: duplicateCheck.rows[0].id });
-        }
-
-        const insertAttendance = await pool.query(
-            "INSERT INTO attendances (class_id, student_id) VALUES ($1, $2) RETURNING id, class_id, student_id, timestamp",
-            [classId, studentId]
-        );
-
-        res.status(201).send({ message: "Attendance recorded", attendance: insertAttendance.rows[0] });
+        res.status(201).send({ message: "Attendance processed", attendance: results });
     } catch (error) {
         console.error("❌ Database error recording attendance:", error);
         res.status(500).send({ error: "Internal server error" });
