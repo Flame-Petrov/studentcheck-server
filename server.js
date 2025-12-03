@@ -169,6 +169,7 @@ app.post("/studentLogin", async (req, res) => {
             res.send({ 
                 message: "Student login successful", 
                 student: {
+                    id: student.id,
                     facultyNumber: student.faculty_number,
                     fullName: student.full_name,
                     email: student.email
@@ -513,7 +514,7 @@ app.get("/attendance", async (req, res) => {
             return res.send({ message: "Attendance fetched", attendance: rows.rows });
         }
 
-        
+
         const rows = await pool.query(`
             SELECT a.id, a.class_id, a.student_id, a.timestamp,
                          s.full_name AS student_name, c.name AS class_name
