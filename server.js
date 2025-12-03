@@ -435,14 +435,26 @@ app.get("/get_student_classes", async (req, res) => {
 
     console.log('Query result:', result.rows);
 
+    let classNames = [];
+
+    result.rows.forEach(row => {
+        console.log("Class ID for student:", row.class_id);
+        const nameResult = pool.query("SELECT name FROM classes WHERE id = $1", [row.class_id]);
+        if(nameResult.rows.length > 0){
+            const className = nameResult.rows[0].name;
+            console.log("Class name:", className);
+            classNames.push(className);
+        }
+    });
+
+    console.log("Class names:", classNames ,"for student:", studentId);
+
     return res.send({
         message: "Student classes fetched",
-        class_students: result.rows
+        class_names: classNames
     });
 
 });
-
-
 
 
 
