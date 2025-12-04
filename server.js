@@ -638,18 +638,26 @@ app.get("/get_student_attendance_count", async (req, res) => {
 
     console.log("classId:", classId, "studentId:", studentId);
 
-    const sql = `SELECT count FROM attendances WHERE class_id = $1 AND student_id = $2`;
-    const result  = await pool.query(sql, [classId, studentId]);
+    const sqlForStudentAttendance = `SELECT count FROM attendances WHERE class_id = $1 AND student_id = $2`;
+
+    const sqlForTotalCompletedClasses = `SELECT completed_classes_count FROM classes WHERE id = $1`;
+
+    const result  = await pool.query(sqlForStudentAttendance, [classId, studentId]);
+    const result2 = await pool.query(sqlForTotalCompletedClasses, [classId]);
 
     console.log('Query result:', result.rows);
+    console.log('Query result 2:', result2.rows);
 
     let attendanceCount = result.rows[0].count;
+    let totalCompletedClassesCount = result2.rows[0].completed_classes_count;
 
     console.log("Attendance count:", attendanceCount);
+    console.log("Total completed classes count:", totalCompletedClassesCount);
     
     return res.send({
         message: "Student attendance count fetched",
-        attendance_count: attendanceCount
+        attendance_count: attendanceCount,
+        total_completed_classes_count: totalCompletedClassesCount
     });
 
 });
@@ -657,7 +665,7 @@ app.get("/get_student_attendance_count", async (req, res) => {
 
 
 app.post("/update_completed_classes_count", async (req, res) => {
-    
+
     console.log();
     console.log('Received POST /update_completed_classes_count');
     console.log('Request body:', req.body);
