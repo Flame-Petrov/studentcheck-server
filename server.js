@@ -626,6 +626,70 @@ app.all("/heartbeat", (req, res) => {
 
 
 
+app.post("/save_student_timestamps", async (req, res) => {
+
+    console.log();
+    console.log('Received POST /save_student_timestamps');
+    console.log('Request body:', req.body);
+    
+    var classId = req.body.class_id;
+    var studentId = req.body.student_id;
+
+    var timestamps = req.body.timestamps; // array of timestamps
+
+    var joined_at_raw = timestamps.joined_at;
+    var left_at_raw = timestamps.left_at;
+
+    // var joined_at_seconds = Math.floor(joined_at_raw / 1000);
+    // var left_at_seconds = Math.floor(left_at_raw / 1000);
+
+    // var joined_at = new Date(joined_at_seconds * 1000);
+    // var left_at = new Date(left_at_seconds * 1000);
+
+    // const formatted_joined_at = joined_at.toLocaleString('bg-BG',
+    //     { 
+    //         year: 'numeric',
+    //         month: '2-digit',
+    //         day: '2-digit',
+    //         hour: '2-digit',
+    //         minute: '2-digit',
+    //         second: '2-digit',
+    //     }
+    // );
+
+    // const formatted_left_at = left_at.toLocaleString('bg-BG',
+    //     { 
+    //         year: 'numeric',
+    //         month: '2-digit',
+    //         day: '2-digit',
+    //         hour: '2-digit',
+    //         minute: '2-digit',
+    //         second: '2-digit',
+    //     }
+    // );
+
+    console.log("classId:", classId, "studentId:", studentId);
+
+    // console.log("Formatted joined_at:", formatted_joined_at);
+    // console.log("Formatted left_at:", formatted_left_at);
+
+    console.log("Raw joined_at timestamp:", joined_at_raw);
+    console.log("Raw left_at timestamp:", left_at_raw);
+
+    const sql = `INSERT INTO attendance_timestamps (class_id, student_id, joined_at, left_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`;
+
+    const result  = await pool.query(sql, [classId, studentId, joined_at_raw, left_at_raw]);
+    console.log('Query result:', result.rows);
+
+    console.log("Student timestamps saved for classId:", classId, "studentId:", studentId);
+    
+    return res.send({
+        message: "Student timestamps saved"
+    });
+
+});
+
+
 
 app.get("/get_student_attendance_count", async (req, res) => {
     
