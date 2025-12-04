@@ -650,13 +650,11 @@ app.post("/save_student_timestamps", async (req, res) => {
         console.error("Error: Student not found with faculty number:", studentFacultyNumber);
         return res.status(404).send({ error: "Student not found in database." });
     }
-
-    var timestamps = req.body.timestamps; // array of timestamps
-
+    
     try{
 
-        var joined_at_raw = timestamps.joined_at;
-        var left_at_raw = timestamps.left_at;
+        var joined_at_raw = req.body.joined_at;
+        var left_at_raw = req.body.left_at;
 
     }catch(error){
         console.error("Error extracting timestamps from student. Probably missing from the class.\nStudent: ", studentFacultyNumber, "in class:", classId);
