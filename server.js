@@ -654,12 +654,13 @@ app.post("/save_student_timestamps", async (req, res) => {
     var joined_at_raw = req.body.joined_at;
     var left_at_raw = req.body.left_at;
 
+    if(joined_at_raw == null || left_at_raw == null){
+        console.error("This student has not attended the class: ", studentFacultyNumber);
+        return res.status(400).send({ error: `${studentFacultyNumber} has not been marked as attended.` });
+    }
+
     var joined_at = new Date(joined_at_raw).toISOString();
     var left_at = new Date(left_at_raw).toISOString();
-
-    
-
-
 
     // var joined_at_seconds = Math.floor(joined_at_raw / 1000);
     // var left_at_seconds = Math.floor(left_at_raw / 1000);
