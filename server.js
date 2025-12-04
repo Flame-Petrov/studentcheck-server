@@ -650,16 +650,13 @@ app.post("/save_student_timestamps", async (req, res) => {
         console.error("Error: Student not found with faculty number:", studentFacultyNumber);
         return res.status(404).send({ error: "Student not found in database." });
     }
-    
-    try{
 
-        var joined_at_raw = req.body.joined_at;
-        var left_at_raw = req.body.left_at;
+    var joined_at_raw = req.body.joined_at;
+    var left_at_raw = req.body.left_at;
 
-    }catch(error){
-        console.error("Error extracting timestamps from student. Probably missing from the class.\nStudent: ", studentFacultyNumber, "in class:", classId);
-        return res.status(400).send({ error: "Error extracting timestamps from student:", studentFacultyNumber});
-    }
+    var joined_at_seconds = Math.floor(joined_at_raw / 1000);
+    var left_at_seconds = Math.floor(left_at_raw / 1000);
+
     
 
 
@@ -697,12 +694,12 @@ app.post("/save_student_timestamps", async (req, res) => {
     // console.log("Formatted joined_at:", formatted_joined_at);
     // console.log("Formatted left_at:", formatted_left_at);
 
-    console.log("Raw joined_at timestamp:", joined_at_raw);
-    console.log("Raw left_at timestamp:", left_at_raw);
+    console.log("Seconds joined_at timestamp:", joined_at_seconds);
+    console.log("Seconds left_at timestamp:", left_at_seconds);
 
     const sql = `INSERT INTO attendance_timestamps (class_id, student_id, joined_at, left_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`;
 
-    const result  = await pool.query(sql, [classId, studentId, joined_at_raw, left_at_raw]);
+    const result  = await pool.query(sql, [classId, studentId, joined_at_seconds, left_at_seconds]);
     console.log('Query result:', result.rows);
 
     console.log("Student timestamps saved for classId:", classId, "studentId:", studentId);
