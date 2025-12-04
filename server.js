@@ -635,9 +635,16 @@ app.post("/save_student_timestamps", async (req, res) => {
     var classId = req.body.class_id;
     var studentFacultyNumber = req.body.faculty_number;
 
-    const studentId = await pool.query(
+    const studentIdQueryResult = await pool.query(
         "SELECT id FROM students WHERE faculty_number = $1", [studentFacultyNumber]
     );
+
+    console.log("studentId query result:", studentIdQueryResult.rows);
+    console.log("Type of studentId.rows:", typeof studentIdQueryResult.rows);
+    
+    const studentId = studentIdQueryResult.rows[0];
+    console.log("studentId:", studentId);
+    console.log("Type of studentId:", typeof studentId);
 
     if(!studentId){
         console.error("Error: Student not found with faculty number:", studentFacultyNumber);
