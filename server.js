@@ -639,12 +639,7 @@ app.post("/save_student_timestamps", async (req, res) => {
         "SELECT id FROM students WHERE faculty_number = $1", [studentFacultyNumber]
     );
 
-    console.log("studentId query result:", studentIdQueryResult.rows);
-    console.log("Type of studentId.rows:", typeof studentIdQueryResult.rows);
-    
     const studentId = Number(studentIdQueryResult.rows[0].id);
-    console.log("studentId:", studentId);
-    console.log("Type of studentId:", typeof studentId);
 
     if(!studentId){
         console.error("Error: Student not found with faculty number:", studentFacultyNumber);
@@ -659,51 +654,27 @@ app.post("/save_student_timestamps", async (req, res) => {
         return res.status(400).send({ error: `${studentFacultyNumber} has not been marked as attended.` });
     }
 
-    var joined_at = new Date(joined_at_raw).toISOString();
-    var left_at = new Date(left_at_raw).toISOString();
+    // Format timestamps in Bulgarian timezone (Europe/Sofia)
+    const dateTimeBG = new Intl.DateTimeFormat('bg-BG', {
+        timeZone: 'Europe/Sofia',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
 
-    // var joined_at_seconds = Math.floor(joined_at_raw / 1000);
-    // var left_at_seconds = Math.floor(left_at_raw / 1000);
+    const joinedAtDate = new Date(joined_at_raw);
+    const leftAtDate = new Date(left_at_raw);
 
-    // var joined_at = new Date(joined_at_seconds * 1000);
-    // var left_at = new Date(left_at_seconds * 1000);
-
-    // const formatted_joined_at = joined_at.toLocaleString('bg-BG',
-    //     { 
-    //         year: 'numeric',
-    //         month: '2-digit',
-    //         day: '2-digit',
-    //         hour: '2-digit',
-    //         minute: '2-digit',
-    //         second: '2-digit',
-    //     }
-    // );
-
-    // const formatted_left_at = left_at.toLocaleString('bg-BG',
-    //     { 
-    //         year: 'numeric',
-    //         month: '2-digit',
-    //         day: '2-digit',
-    //         hour: '2-digit',
-    //         minute: '2-digit',
-    //         second: '2-digit',
-    //     }
-    // );
-
-    console.log("classId:", classId, "studentId:", studentId);
-
-    // console.log("Formatted joined_at:", formatted_joined_at);
-    // console.log("Formatted left_at:", formatted_left_at);
-
+    var joined_at = dateTimeBG.format(joinedAtDate);
+    var left_at = dateTimeBG.format(leftAtDate);
+    
     console.log("joined_at timestamp:", joined_at);
     console.log("left_at timestamp:", left_at);
 
     const sql = `INSERT INTO attendance_timestamps (class_id, student_id, joined_at, left_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`;
 
     const result  = await pool.query(sql, [classId, studentId, joined_at, left_at]);
-    console.log('Query result:', result.rows);
 
-    console.log("Student timestamps saved for classId:", classId, "studentId:", studentId);
+    console.log("Student timestamps saved successfully for student:", studentId);
     
     return res.send({
         message: "Student timestamps saved"
