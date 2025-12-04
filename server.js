@@ -633,12 +633,31 @@ app.post("/save_student_timestamps", async (req, res) => {
     console.log('Request body:', req.body);
     
     var classId = req.body.class_id;
-    var studentId = req.body.student_id;
+    var studentFacultyNumber = req.body.faculty_number;
+
+    const studentId = await pool.query(
+        "SELECT id FROM students WHERE faculty_number = $1", [studentFacultyNumber]
+    );
+
+    if(!studentId){
+        console.error("Error: Student not found with faculty number:", studentFacultyNumber);
+        return res.status(404).send({ error: "Student not found in database." });
+    }
 
     var timestamps = req.body.timestamps; // array of timestamps
 
-    var joined_at_raw = timestamps.joined_at;
-    var left_at_raw = timestamps.left_at;
+    try{
+
+        var joined_at_raw = timestamps.joined_at;
+        var left_at_raw = timestamps.left_at;
+
+    }catch(error){
+        console.error("Error extracting timestamps from student. Probably missing from the class.\nStudent: ", studentFacultyNumber, "in class:", classId);
+        return res.status(400).send({ error: "Error extracting timestamps from student:", studentFacultyNumber});
+    }
+    
+
+
 
     // var joined_at_seconds = Math.floor(joined_at_raw / 1000);
     // var left_at_seconds = Math.floor(left_at_raw / 1000);
