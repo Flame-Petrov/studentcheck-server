@@ -438,7 +438,6 @@ app.get("/get_student_classes", async (req, res) => {
 
 
 
-
     // Collect unique class IDs from result rows
     const classIds = Array.from(new Set(result.rows.map(row => Number(row.class_id)).filter(Boolean)));
 
@@ -472,6 +471,35 @@ app.get("/get_student_classes", async (req, res) => {
 });
 
 
+
+
+
+app.get("/get_class_id_by_name", async (req, res) => {
+    console.log();
+    console.log('Received GET /get_class_id_by_name');
+    console.log("Query params:", req.query);
+
+    var className = req.query.class_name;
+    console.log("className:", className);
+
+    const sql = `SELECT id FROM classes WHERE name = $1`;
+    const result  = await pool.query(sql, [className]);
+
+    console.log('Query result:', result.rows);
+
+    if (result.rows.length === 0) {
+        return res.status(404).send({ error: "Class not found" });
+    }
+
+    const class_id = result.rows[0].id;
+
+    console.log("Class ID:", class_id);
+
+    return res.send({
+        message: "Class ID fetched",
+        class_id: class_id
+    });
+});
 
 
 
@@ -594,6 +622,37 @@ app.all("/heartbeat", (req, res) => {
     res.status(204).end();
 });
 
+
+
+
+
+
+app.get("/student_attendance_count", async (req, res) => {
+    
+    console.log();
+    console.log('Received GET /student_attendance_count');
+    console.log("Query params:", req.query);
+
+    var classId = req.query.class_id;
+    var studentId = req.query.student_id;;
+
+    console.log("classId:", classId, "studentId:", studentId);
+
+    const sql = `SELECT count FROM attendances WHERE class_id = $1 AND student_id = $2`;
+    const result  = await pool.query(sql, [classId, studentId]);
+
+    console.log('Query result:', result.rows);
+
+    let attendanceCount = result.rows[0].count;
+
+    console.log("Attendance count:", attendanceCount);
+    
+    return res.send({
+        message: "Student attendance count fetched",
+        attendance_count: attendanceCount
+    });
+
+});
 
 
 
