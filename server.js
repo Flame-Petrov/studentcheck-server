@@ -654,8 +654,8 @@ app.post("/save_student_timestamps", async (req, res) => {
     var joined_at_raw = req.body.joined_at;
     var left_at_raw = req.body.left_at;
 
-    var joined_at_seconds = Math.floor(joined_at_raw / 1000);
-    var left_at_seconds = Math.floor(left_at_raw / 1000);
+    var joined_at = new Date(joined_at_raw).toISOString();
+    var left_at = new Date(left_at_raw).toISOString();
 
     
 
@@ -694,12 +694,12 @@ app.post("/save_student_timestamps", async (req, res) => {
     // console.log("Formatted joined_at:", formatted_joined_at);
     // console.log("Formatted left_at:", formatted_left_at);
 
-    console.log("Seconds joined_at timestamp:", joined_at_seconds);
-    console.log("Seconds left_at timestamp:", left_at_seconds);
+    console.log("joined_at timestamp:", joined_at);
+    console.log("left_at timestamp:", left_at);
 
     const sql = `INSERT INTO attendance_timestamps (class_id, student_id, joined_at, left_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`;
 
-    const result  = await pool.query(sql, [classId, studentId, joined_at_seconds, left_at_seconds]);
+    const result  = await pool.query(sql, [classId, studentId, joined_at, left_at]);
     console.log('Query result:', result.rows);
 
     console.log("Student timestamps saved for classId:", classId, "studentId:", studentId);
