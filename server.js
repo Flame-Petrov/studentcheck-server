@@ -642,7 +642,7 @@ app.post("/save_student_timestamps", async (req, res) => {
     console.log("studentId query result:", studentIdQueryResult.rows);
     console.log("Type of studentId.rows:", typeof studentIdQueryResult.rows);
     
-    const studentId = studentIdQueryResult.rows[0];
+    const studentId = studentIdQueryResult.rows[0].id;
     console.log("studentId:", studentId);
     console.log("Type of studentId:", typeof studentId);
 
