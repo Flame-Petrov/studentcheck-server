@@ -648,8 +648,16 @@ app.get("/get_student_attendance_count", async (req, res) => {
     console.log('Query result:', result.rows);
     console.log('Query result 2:', result2.rows);
 
-    let attendanceCount = result.rows[0].count;
-    let totalCompletedClassesCount = result2.rows[0].completed_classes_count;
+    let attendanceCount = 0;
+    let totalCompletedClassesCount = 0;
+
+    try{
+        attendanceCount = result.rows[0].count;
+        totalCompletedClassesCount = result2.rows[0].completed_classes_count;
+    }catch(error){
+        console.log("Error extracting attendanceCount or totalCompletedClassesCount:", error);
+    }
+    
 
     console.log("Attendance count:", attendanceCount);
     console.log("Total completed classes count:", totalCompletedClassesCount);
