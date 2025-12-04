@@ -653,9 +653,14 @@ app.get("/get_student_attendance_count", async (req, res) => {
 
     try{
         attendanceCount = result.rows[0].count;
-        totalCompletedClassesCount = result2.rows[0].completed_classes_count;
     }catch(error){
         console.log("Error extracting attendanceCount or totalCompletedClassesCount:", error);
+    }
+
+    try{
+        totalCompletedClassesCount = result2.rows[0].completed_classes_count;
+    }catch(error){
+        console.log("Error extracting totalCompletedClassesCount:", error);
     }
     
 
