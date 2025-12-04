@@ -627,7 +627,7 @@ app.all("/heartbeat", (req, res) => {
 
 
 
-app.get("/student_attendance_count", async (req, res) => {
+app.get("/get_student_attendance_count", async (req, res) => {
     
     console.log();
     console.log('Received GET /student_attendance_count');
