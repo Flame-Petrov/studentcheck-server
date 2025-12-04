@@ -656,6 +656,29 @@ app.get("/get_student_attendance_count", async (req, res) => {
 
 
 
+app.post("/update_completed_classes_count", async (req, res) => {
+    
+    console.log();
+    console.log('Received POST /update_completed_classes_count');
+    console.log('Request body:', req.body);
+    
+    var classId = req.body.class_id;
+
+    console.log("classId:", classId);
+
+    const sql = `UPDATE classes SET completed_classes_count = completed_classes_count + 1 WHERE id = $1`;
+    const result  = await pool.query(sql, [classId]);
+
+    console.log('Query result:', result.rows);
+    
+    return res.send({
+        message: "Completed classes count updated"
+    });
+
+});
+
+
+
 
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
