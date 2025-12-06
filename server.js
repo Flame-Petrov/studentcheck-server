@@ -206,8 +206,8 @@ app.post("/registration", async (req, res) => {
 
                 const result = await pool.query(
                     // syntax for reserved word "group" needs quotes
-                    "INSERT INTO students (full_name, email, faculty_number, password, created, \"group\") VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, full_name, email, faculty_number, created, \"group\"",
-                    [fullName, user.email, user.facultyNumber, user.password, new Date(), user.group]
+                    "INSERT INTO students (full_name, email, faculty_number, password, level, faculty, specialization, \"group\", created) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, full_name, email, faculty_number, created, \"group\"",
+                    [fullName, user.email, user.facultyNumber, user.password, user.level, user.faculty, user.specialization, user.group, new Date()]
                 );
 
         const student = result.rows[0]; // inserted record without sensitive fields
