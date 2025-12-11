@@ -606,6 +606,80 @@ app.get("/attendance", async (req, res) => {
 
 
 
+// ----------------- Remove Student from Class Endpoint -----------------
+// Expects body: { class_id: number, student_id: number, teacherEmail: string }
+// Validates that teacher owns the class before deleting
+app.post("/class_students/remove", async (req, res) => {
+    console.log();
+    console.log("Received POST /class_students/remove");
+    console.log("Request body:", req.body);
+
+    const { class_id, student_id, teacherEmail } = req.body;
+
+    // Validate required fields
+    if (!class_id || !student_id) {
+        return res.status(400).send({ error: "class_id and student_id are required" });
+    }
+    if (!teacherEmail) {
+        return res.status(400).send({ error: "teacherEmail is required for authorization" });
+    }
+
+    try {
+        // Step 1: Verify teacher exists and get teacher ID
+        const teacherResult = await pool.query(
+            "SELECT id FROM teachers WHERE email = $1",
+            [teacherEmail]
+        );
+        if (teacherResult.rows.length === 0) {
+            return res.status(401).send({ error: "Teacher not found" });
+        }
+        const teacherId = teacherResult.rows[0].id;
+        console.log("Teacher ID found:", teacherId);
+
+        // Step 2: Verify teacher owns the class
+        const classResult = await pool.query(
+            "SELECT id, teacher_id FROM classes WHERE id = $1",
+            [class_id]
+        );
+        if (classResult.rows.length === 0) {
+            return res.status(404).send({ error: "Class not found" });
+        }
+        const classTeacherId = classResult.rows[0].teacher_id;
+        if (classTeacherId !== teacherId) {
+            return res.status(403).send({ error: "You do not have permission to modify this class" });
+        }
+        console.log("Teacher ownership verified for class:", class_id);
+
+        // Step 3: Verify student exists in class_students
+        const studentInClassResult = await pool.query(
+            "SELECT id FROM class_students WHERE class_id = $1 AND student_id = $2",
+            [class_id, student_id]
+        );
+        if (studentInClassResult.rows.length === 0) {
+            return res.status(404).send({ error: "Student not found in this class" });
+        }
+        console.log("Student found in class");
+
+        // Step 4: Delete the record from class_students
+        const deleteResult = await pool.query(
+            "DELETE FROM class_students WHERE class_id = $1 AND student_id = $2 RETURNING id",
+            [class_id, student_id]
+        );
+        console.log("Student removed from class:", deleteResult.rows[0]);
+
+        res.status(200).send({ 
+            message: "Student successfully removed from class",
+            deletedRecord: deleteResult.rows[0]
+        });
+
+    } catch (error) {
+        console.error("❌ Database error removing student from class:", error);
+        res.status(500).send({ error: "Internal server error" });
+    }
+});
+
+
+
 
 // Lightweight heartbeat endpoint: fast 204, no caching, accepts any method
 app.all("/heartbeat", (req, res) => {
