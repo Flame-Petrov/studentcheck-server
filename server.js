@@ -607,24 +607,35 @@ app.get("/attendance", async (req, res) => {
 
 
 // ----------------- Remove Student from Class Endpoint -----------------
-// Expects body: { class_id: number, student_id: number, teacherEmail: string }
+// Expects body: { class_id: number, faculty_number: string, teacherEmail: string }
 // Validates that teacher owns the class before deleting
 app.post("/class_students/remove", async (req, res) => {
     console.log();
     console.log("Received POST /class_students/remove");
     console.log("Request body:", req.body);
 
-    const { class_id, student_id, teacherEmail } = req.body;
+    const { class_id, faculty_number, teacherEmail } = req.body;
 
     // Validate required fields
-    if (!class_id || !student_id) {
-        return res.status(400).send({ error: "class_id and student_id are required" });
+    if (!class_id || !faculty_number) {
+        return res.status(400).send({ error: "class_id and faculty_number are required" });
     }
     if (!teacherEmail) {
         return res.status(400).send({ error: "teacherEmail is required for authorization" });
     }
 
     try {
+        // Step 0: Get student ID from faculty number
+        const studentResult = await pool.query(
+            "SELECT id FROM students WHERE faculty_number = $1",
+            [faculty_number]
+        );
+        if (studentResult.rows.length === 0) {
+            return res.status(404).send({ error: "Student not found with this faculty number" });
+        }
+        const student_id = studentResult.rows[0].id;
+        console.log("Student ID found:", student_id);
+
         // Step 1: Verify teacher exists and get teacher ID
         const teacherResult = await pool.query(
             "SELECT id FROM teachers WHERE email = $1",
