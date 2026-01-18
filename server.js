@@ -13,6 +13,19 @@ const rawError = console.error.bind(console);
 
 const logDivider = () => rawLog("============================================================");
 
+const formatBgTime = (date = new Date()) => {
+    const formatter = new Intl.DateTimeFormat("bg-BG", {
+        timeZone: "Europe/Sofia",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+    });
+    return formatter.format(date);
+};
+
 const scrubRequestBody = (body) => {
     if (!body || typeof body !== "object") return body;
     const cleaned = { ...body };
@@ -25,7 +38,7 @@ const scrubRequestBody = (body) => {
 const logRequestStart = (req, options = {}) => {
     const { note, includeBody = true } = options;
     logDivider();
-    rawLog(`[REQUEST] ${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
+    rawLog(`[REQUEST] ${formatBgTime()} ${req.method} ${req.originalUrl}`);
     if (note) {
         rawLog(`[REQUEST] Note: ${note}`);
     }
@@ -39,8 +52,8 @@ const logRequestStart = (req, options = {}) => {
     logDivider();
 };
 
-console.log = (...args) => rawLog(`[INFO ${new Date().toISOString()}]`, ...args);
-console.error = (...args) => rawError(`[ERROR ${new Date().toISOString()}]`, ...args);
+console.log = (...args) => rawLog(`[INFO ${formatBgTime()}]`, ...args);
+console.error = (...args) => rawError(`[ERROR ${formatBgTime()}]`, ...args);
 
 // Central CORS configuration (explicit preflight + allowed headers)
 const allowedOrigins = ["https://studentcheck-9ucp.onrender.com"]; // frontend origin(s)
