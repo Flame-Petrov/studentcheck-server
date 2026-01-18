@@ -15,7 +15,7 @@ app.use(cors({
         if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
         return callback(new Error("Not allowed by CORS"));
     },
-    methods: ["GET", "POST", "OPTIONS"],
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
     credentials: true,
     maxAge: 86400 // cache preflight for a day
@@ -27,7 +27,7 @@ app.use((req, res, next) => {
         // Extra headers in case cors library missed something
         res.header("Access-Control-Allow-Origin", allowedOrigins[0]);
         res.header("Access-Control-Allow-Credentials", "true");
-        res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+        res.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
         res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
         console.log(`🛰️ Preflight ${req.method} ${req.originalUrl} -> 204`);
         return res.status(204).end();
@@ -313,6 +313,75 @@ app.get("/classes", async (req, res) => {
     } catch (error) {
         console.error("❌ Database error fetching classes:", error);
         res.status(500).send({ error: "Internal server error" });
+    }
+});
+
+// ----------------- Class Deletion Endpoint -----------------
+// Expects body: { classId: number, teacherEmail: string }
+// Deletes class + related rows (class_students, attendances, attendance_timestamps)
+app.delete("/classes", async (req, res) => {
+    console.log();
+    console.log("Received DELETE /classes");
+    console.log("Request body:", req.body);
+
+    const { classId, teacherEmail } = req.body || {};
+
+    if (!classId) {
+        return res.status(400).send({ error: "classId is required" });
+    }
+    if (!teacherEmail) {
+        return res.status(400).send({ error: "teacherEmail is required" });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+
+        const teacherResult = await client.query(
+            "SELECT id FROM teachers WHERE email = $1",
+            [teacherEmail]
+        );
+        if (teacherResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return res.status(404).send({ error: "Teacher not found" });
+        }
+        const teacherId = teacherResult.rows[0].id;
+
+        const classResult = await client.query(
+            "SELECT id, teacher_id FROM classes WHERE id = $1",
+            [classId]
+        );
+        if (classResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return res.status(404).send({ error: "Class not found" });
+        }
+        if (classResult.rows[0].teacher_id !== teacherId) {
+            await client.query("ROLLBACK");
+            return res.status(403).send({ error: "You do not have permission to delete this class" });
+        }
+
+        await client.query("DELETE FROM class_students WHERE class_id = $1", [classId]);
+        await client.query("DELETE FROM attendance_timestamps WHERE class_id = $1", [classId]);
+        await client.query("DELETE FROM attendances WHERE class_id = $1", [classId]);
+
+        const deleteClass = await client.query(
+            "DELETE FROM classes WHERE id = $1 AND teacher_id = $2 RETURNING id",
+            [classId, teacherId]
+        );
+
+        if (deleteClass.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return res.status(404).send({ error: "Class not found for this teacher" });
+        }
+
+        await client.query("COMMIT");
+        return res.status(200).send({ success: true });
+    } catch (error) {
+        await client.query("ROLLBACK");
+        console.error("❌ Database error deleting class:", error);
+        return res.status(500).send({ error: "Internal server error" });
+    } finally {
+        client.release();
     }
 });
 
