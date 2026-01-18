@@ -63,7 +63,7 @@ app.use(cors({
         if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
         return callback(new Error("Not allowed by CORS"));
     },
-    methods: ["GET", "POST", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
     credentials: true,
     maxAge: 86400 // cache preflight for a day
@@ -75,7 +75,7 @@ app.use((req, res, next) => {
         // Extra headers in case cors library missed something
         res.header("Access-Control-Allow-Origin", allowedOrigins[0]);
         res.header("Access-Control-Allow-Credentials", "true");
-        res.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+        res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
         res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
         logRequestStart(req, { note: "Preflight -> 204", includeBody: false });
         return res.status(204).end();
@@ -381,6 +381,60 @@ app.get("/classes", async (req, res) => {
     } catch (error) {
         console.error("❌ Database error fetching classes:", error);
         res.status(500).send({ error: "Internal server error" });
+    }
+});
+
+// ----------------- Class Rename Endpoint -----------------
+// Expects body: { classId: number, name: string, teacherEmail: string }
+app.put("/classes", async (req, res) => {
+    logRequestStart(req);
+
+    const { classId, name, teacherEmail } = req.body || {};
+
+    if (!classId) {
+        return res.status(400).send({ error: "classId is required" });
+    }
+    if (!name) {
+        return res.status(400).send({ error: "name is required" });
+    }
+    if (!teacherEmail) {
+        return res.status(400).send({ error: "teacherEmail is required" });
+    }
+
+    try {
+        const teacherResult = await pool.query(
+            "SELECT id FROM teachers WHERE email = $1",
+            [teacherEmail]
+        );
+        if (teacherResult.rows.length === 0) {
+            return res.status(404).send({ error: "Teacher not found" });
+        }
+        const teacherId = teacherResult.rows[0].id;
+
+        const classResult = await pool.query(
+            "SELECT id, teacher_id FROM classes WHERE id = $1",
+            [classId]
+        );
+        if (classResult.rows.length === 0) {
+            return res.status(404).send({ error: "Class not found" });
+        }
+        if (classResult.rows[0].teacher_id !== teacherId) {
+            return res.status(403).send({ error: "You do not have permission to rename this class" });
+        }
+
+        const updateResult = await pool.query(
+            "UPDATE classes SET name = $1 WHERE id = $2 AND teacher_id = $3",
+            [name, classId, teacherId]
+        );
+
+        if (updateResult.rowCount === 0) {
+            return res.status(404).send({ error: "Class not found for this teacher" });
+        }
+
+        return res.status(200).send({ success: true });
+    } catch (error) {
+        console.error("❌ Database error renaming class:", error);
+        return res.status(500).send({ error: "Internal server error" });
     }
 });
 
