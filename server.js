@@ -554,8 +554,17 @@ app.get("/class_students", async (req, res) => {
 app.get("/get_student_classes", async (req, res) => {
     logRequestStart(req);
 
-    var studentId = req.query.student_id;;
-    console.log("studentId:", studentId);
+    const rawStudentId = req.query.student_id;
+    console.log("studentId (raw):", rawStudentId);
+
+    if (!rawStudentId || rawStudentId === "undefined" || rawStudentId === "null") {
+        return res.status(400).send({ error: "student_id query parameter is required" });
+    }
+
+    const studentId = Number(rawStudentId);
+    if (!Number.isFinite(studentId) || studentId <= 0) {
+        return res.status(400).send({ error: "student_id must be a valid number" });
+    }
 
     const sql = `SELECT * FROM class_students WHERE student_id = $1`;
     const result  = await pool.query(sql, [studentId]);
