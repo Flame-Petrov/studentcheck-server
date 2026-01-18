@@ -7,6 +7,41 @@ const { Pool } = require("pg"); // PostgreSQL client
 
 const app = express();
 
+// ----------------- Structured Logging Helpers -----------------
+const rawLog = console.log.bind(console);
+const rawError = console.error.bind(console);
+
+const logDivider = () => rawLog("============================================================");
+
+const scrubRequestBody = (body) => {
+    if (!body || typeof body !== "object") return body;
+    const cleaned = { ...body };
+    if (Object.prototype.hasOwnProperty.call(cleaned, "password")) {
+        cleaned.password = "[REDACTED]";
+    }
+    return cleaned;
+};
+
+const logRequestStart = (req, options = {}) => {
+    const { note, includeBody = true } = options;
+    logDivider();
+    rawLog(`[REQUEST] ${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
+    if (note) {
+        rawLog(`[REQUEST] Note: ${note}`);
+    }
+    const query = req.query || {};
+    if (Object.keys(query).length) {
+        rawLog("[REQUEST] Query:", query);
+    }
+    if (includeBody && req.body && Object.keys(req.body).length) {
+        rawLog("[REQUEST] Body:", scrubRequestBody(req.body));
+    }
+    logDivider();
+};
+
+console.log = (...args) => rawLog(`[INFO ${new Date().toISOString()}]`, ...args);
+console.error = (...args) => rawError(`[ERROR ${new Date().toISOString()}]`, ...args);
+
 // Central CORS configuration (explicit preflight + allowed headers)
 const allowedOrigins = ["https://studentcheck-9ucp.onrender.com"]; // frontend origin(s)
 app.use(cors({
@@ -29,7 +64,7 @@ app.use((req, res, next) => {
         res.header("Access-Control-Allow-Credentials", "true");
         res.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
         res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-        console.log(`🛰️ Preflight ${req.method} ${req.originalUrl} -> 204`);
+        logRequestStart(req, { note: "Preflight -> 204", includeBody: false });
         return res.status(204).end();
     }
     next();
@@ -85,10 +120,7 @@ const pool = new Pool({
 
 
 app.post("/teacherLogin", async (req, res) => {
-
-    console.log();
-    console.log('Received POST /teacherLogin');
-    console.log('Request body:', req.body);
+    logRequestStart(req);
 
     try {
         const { email, password } = req.body;
@@ -140,10 +172,7 @@ app.post("/teacherLogin", async (req, res) => {
 
 
 app.post("/studentLogin", async (req, res) => {
-
-    console.log();
-    console.log('Received POST /studentLogin');
-    console.log('Request body:', req.body);
+    logRequestStart(req);
 
     try {
         const { facultyNumber, password } = req.body;
@@ -193,12 +222,7 @@ app.post("/studentLogin", async (req, res) => {
 
 
 app.post("/registration", async (req, res) => {
-
-    console.log();
-    console.log('Received POST /registration');
-    // Avoid logging passwords in plaintext
-    const { password: _pw, ...safeBody } = req.body || {};
-    console.log('Request body (sanitized):', safeBody);
+    logRequestStart(req);
 
     try {
         const user = req.body;
@@ -234,13 +258,48 @@ app.post("/registration", async (req, res) => {
 
 
 app.get("/students", async (req, res) => {
-    console.log();
-    console.log('Received GET /students');
-    var result = await pool.query("SELECT * FROM students");
-    // console.log('Query result:', result.rows);
-    result = result.rows;
-    // console.log('Processed result:', result);
-    res.send({message: "Students endpoint reached", students: result });
+    logRequestStart(req);
+
+    const {
+        level,
+        faculty,
+        specialization,
+        group,
+        search
+    } = req.query || {};
+
+    try {
+        const whereClauses = [];
+        const params = [];
+
+        const addFilter = (column, value) => {
+            params.push(String(value).toLowerCase());
+            whereClauses.push(`LOWER(${column}) = $${params.length}`);
+        };
+
+        if (level) addFilter("level", level);
+        if (faculty) addFilter("faculty", faculty);
+        if (specialization) addFilter("specialization", specialization);
+        if (group) addFilter("\"group\"", group);
+
+        if (search) {
+            const term = `%${String(search).toLowerCase()}%`;
+            params.push(term);
+            const placeholder = `$${params.length}`;
+            whereClauses.push(
+                `(LOWER(full_name) LIKE ${placeholder} OR LOWER(email) LIKE ${placeholder} OR LOWER(faculty_number) LIKE ${placeholder})`
+            );
+        }
+
+        const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(" AND ")}` : "";
+        const sql = `SELECT * FROM students ${whereSql} ORDER BY id DESC`;
+
+        const result = await pool.query(sql, params);
+        return res.send({ students: result.rows });
+    } catch (error) {
+        console.error("❌ Database error fetching students:", error);
+        return res.status(500).send({ error: "Internal server error" });
+    }
 });
 
 
@@ -248,9 +307,7 @@ app.get("/students", async (req, res) => {
 // Expects body: { name: string, teacherEmail?: string }
 // Authentication placeholder: teacher identified by provided email (until token/session implemented)
 app.post("/classes", async (req, res) => {
-    console.log();
-    console.log("Received POST /classes");
-    console.log("Request body:", req.body);
+    logRequestStart(req);
 
     const { name, teacherEmail } = req.body || {};
 
@@ -289,9 +346,7 @@ app.post("/classes", async (req, res) => {
 
 // (Optional helper) List classes for a teacher by email query param: /classes?teacherEmail=...
 app.get("/classes", async (req, res) => {
-    console.log();
-    console.log("Received GET /classes");
-    console.log("Query params:", req.query);
+    logRequestStart(req);
     const { teacherEmail } = req.query;
     try {
         if (teacherEmail) {
@@ -320,9 +375,7 @@ app.get("/classes", async (req, res) => {
 // Expects body: { classId: number, teacherEmail: string }
 // Deletes class + related rows (class_students, attendances, attendance_timestamps)
 app.delete("/classes", async (req, res) => {
-    console.log();
-    console.log("Received DELETE /classes");
-    console.log("Request body:", req.body);
+    logRequestStart(req);
 
     const { classId, teacherEmail } = req.body || {};
 
@@ -388,10 +441,7 @@ app.delete("/classes", async (req, res) => {
 
 
 app.post("/class_students", async (req, res) => {
-
-    console.log();
-    console.log('Received POST /class_students');
-    console.log('Request body:', req.body);
+    logRequestStart(req);
 
     var classId = req.body.classId;
     var students = req.body.students; // array of student
@@ -448,9 +498,7 @@ app.post("/class_students", async (req, res) => {
 
 
 app.get("/class_students", async (req, res) => {
-    console.log();
-    console.log('Received GET /class_students');
-    console.log("Query params:", req.query);
+    logRequestStart(req);
     var classId = req.query.class_id;
     console.log("classId:", classId);
     if (!classId) {
@@ -491,10 +539,7 @@ app.get("/class_students", async (req, res) => {
 
 
 app.get("/get_student_classes", async (req, res) => {
-
-    console.log();
-    console.log('Received GET /get_student_classes');
-    console.log("Query params:", req.query);
+    logRequestStart(req);
 
     var studentId = req.query.student_id;;
     console.log("studentId:", studentId);
@@ -544,9 +589,7 @@ app.get("/get_student_classes", async (req, res) => {
 
 
 app.get("/get_class_id_by_name", async (req, res) => {
-    console.log();
-    console.log('Received GET /get_class_id_by_name');
-    console.log("Query params:", req.query);
+    logRequestStart(req);
 
     var className = req.query.class_name;
     console.log("className:", className);
@@ -575,9 +618,7 @@ app.get("/get_class_id_by_name", async (req, res) => {
 // ----------------- Attendance Recording Endpoint -----------------
 // Expects body: { classId: number, studentId: number }
 app.post("/attendance", async (req, res) => {
-    console.log();
-    console.log("Received POST /attendance");
-    console.log("Request body:", req.body);
+    logRequestStart(req);
     
     const classId = req.body.class_id;
     const studentIds = req.body.student_ids; // expect array of student IDs
@@ -631,9 +672,7 @@ app.post("/attendance", async (req, res) => {
 
 // List attendance entries optionally filtered by classId: /attendance?classId=...
 app.get("/attendance", async (req, res) => {
-    console.log();
-    console.log("Received GET /attendance");
-    console.log("Query params:", req.query);
+    logRequestStart(req);
     
     const classId = req.query.class_id;
     const studentId = req.query.student_id;
@@ -679,9 +718,7 @@ app.get("/attendance", async (req, res) => {
 // Expects body: { class_id: number, faculty_number: string, teacherEmail: string }
 // Validates that teacher owns the class before deleting
 app.post("/class_students/remove", async (req, res) => {
-    console.log();
-    console.log("Received POST /class_students/remove");
-    console.log("Request body:", req.body);
+    logRequestStart(req);
 
     const { class_id, faculty_number, teacherEmail } = req.body;
 
@@ -763,8 +800,7 @@ app.post("/class_students/remove", async (req, res) => {
 
 // Lightweight heartbeat endpoint: fast 204, no caching, accepts any method
 app.all("/heartbeat", (req, res) => {
-    console.log();
-    console.log(`Received ${req.method} /heartbeat`);
+    logRequestStart(req, { includeBody: false });
     // Set no-cache headers
     res.set({
         "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
@@ -781,10 +817,7 @@ app.all("/heartbeat", (req, res) => {
 
 
 app.post("/save_student_timestamps", async (req, res) => {
-
-    console.log();
-    console.log('Received POST /save_student_timestamps');
-    console.log('Request body:', req.body);
+    logRequestStart(req);
     
     var classId = req.body.class_id;
     var studentFacultyNumber = req.body.faculty_number;
@@ -839,10 +872,7 @@ app.post("/save_student_timestamps", async (req, res) => {
 
 
 app.get("/get_student_attendance_count", async (req, res) => {
-    
-    console.log();
-    console.log('Received GET /student_attendance_count');
-    console.log("Query params:", req.query);
+    logRequestStart(req);
 
     var classId = req.query.class_id;
     var studentId = req.query.student_id;;
@@ -889,10 +919,7 @@ app.get("/get_student_attendance_count", async (req, res) => {
 
 
 app.post("/update_completed_classes_count", async (req, res) => {
-
-    console.log();
-    console.log('Received POST /update_completed_classes_count');
-    console.log('Request body:', req.body);
+    logRequestStart(req);
     
     var classId = req.body.class_id;
 
