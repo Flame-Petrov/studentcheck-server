@@ -325,21 +325,35 @@ app.post("/classes", async (req, res) => {
     const { name, teacherEmail } = req.body || {};
 
     if (!name) {
-        console.log("Class name is missing in request");
+        console.log("[CLASS CREATE] Validation failed: name is missing");
         return res.status(400).send({ error: "Class name is required" });
     }
     if (!teacherEmail) {
-        console.log("Teacher email is missing in request");
+        console.log("[CLASS CREATE] Validation failed: teacherEmail is missing");
         return res.status(400).send({ error: "Teacher email is required for now" });
     }
 
     try {
-        const teacherResult = await pool.query("SELECT id, email, full_name FROM teachers WHERE email = $1", [teacherEmail]);
+        console.log("[CLASS CREATE] Step 1: Resolve teacher by email");
+        console.log("[CLASS CREATE] teacherEmail:", teacherEmail);
+
+        const teacherResult = await pool.query(
+            "SELECT id, email, full_name FROM teachers WHERE email = $1",
+            [teacherEmail]
+        );
+
+        console.log("[CLASS CREATE] teacherResult.rows.length:", teacherResult.rows.length);
+        console.log("[CLASS CREATE] teacherResult.rows:", teacherResult.rows);
         if (teacherResult.rows.length === 0) {
+            console.log("[CLASS CREATE] Teacher not found, aborting");
             return res.status(404).send({ error: "Teacher not found" });
         }
         const teacherId = teacherResult.rows[0].id;
-        console.log("Teacher ID found:", teacherId);    
+        const teacherName = teacherResult.rows[0].full_name;
+        console.log("[CLASS CREATE] Teacher resolved -> id:", teacherId, "name:", teacherName);
+
+        console.log("[CLASS CREATE] Step 2: Insert class");
+        console.log("[CLASS CREATE] Insert payload:", { teacher_id: teacherId, name });
 
         const insertResult = await pool.query(
             "INSERT INTO classes (teacher_id, name) VALUES ($1, $2) RETURNING id, teacher_id, name",
@@ -348,7 +362,9 @@ app.post("/classes", async (req, res) => {
 
         const created = insertResult.rows[0];
 
-        console.log("Class inserted:", created);
+        console.log("[CLASS CREATE] Insert result rows:", insertResult.rows);
+        console.log("[CLASS CREATE] Created class:", created);
+        console.log("[CLASS CREATE] Step 3: Responding with created class");
         res.status(201).send({ message: "Class created", class: created });
 
     } catch (error) {
