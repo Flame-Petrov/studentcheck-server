@@ -55,6 +55,49 @@ const logRequestStart = (req, options = {}) => {
 console.log = (...args) => rawLog(`[INFO ${formatBgTime()}]`, ...args);
 console.error = (...args) => rawError(`[ERROR ${formatBgTime()}]`, ...args);
 
+const addStudentsToClass = async (classId, students) => {
+    console.log("[CLASS STUDENTS] Begin assignment");
+    console.log("[CLASS STUDENTS] classId:", classId);
+    console.log("[CLASS STUDENTS] students payload:", students);
+
+    const facultyNumbers = students
+        .map(s => s.facultyNumber || s.faculty_number)
+        .filter(Boolean);
+
+    console.log("[CLASS STUDENTS] facultyNumbers:", facultyNumbers);
+
+    if (facultyNumbers.length === 0) {
+        console.log("[CLASS STUDENTS] No valid faculty numbers provided");
+        return { assignedCount: 0, facultyNumbers: [] };
+    }
+
+    const placeholders = facultyNumbers.map((_, i) => `$${i + 1}`).join(",");
+    console.log("[CLASS STUDENTS] placeholders:", placeholders);
+
+    const selectSql = `SELECT id, faculty_number FROM students WHERE faculty_number IN (${placeholders})`;
+    console.log("[CLASS STUDENTS] selectSql:", selectSql);
+
+    const result = await pool.query(selectSql, facultyNumbers);
+    console.log("[CLASS STUDENTS] students matched:", result.rows);
+
+    const idMap = {};
+    result.rows.forEach(row => {
+        idMap[row.id] = row.faculty_number;
+    });
+
+    const insertSql = "INSERT INTO class_students (class_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
+    const studentIds = Object.keys(idMap);
+    console.log("[CLASS STUDENTS] studentIds:", studentIds);
+
+    for (const id of studentIds) {
+        console.log("[CLASS STUDENTS] Assigning student_id:", id, "faculty_number:", idMap[id]);
+        await pool.query(insertSql, [classId, id]);
+    }
+
+    console.log("[CLASS STUDENTS] Assignment complete");
+    return { assignedCount: studentIds.length, facultyNumbers };
+};
+
 // Central CORS configuration (explicit preflight + allowed headers)
 const allowedOrigins = ["https://studentcheck-9ucp.onrender.com"]; // frontend origin(s)
 app.use(cors({
@@ -322,7 +365,7 @@ app.get("/students", async (req, res) => {
 app.post("/classes", async (req, res) => {
     logRequestStart(req);
 
-    const { name, teacherEmail } = req.body || {};
+    const { name, teacherEmail, students } = req.body || {};
 
     if (!name) {
         console.log("[CLASS CREATE] Validation failed: name is missing");
@@ -364,7 +407,15 @@ app.post("/classes", async (req, res) => {
 
         console.log("[CLASS CREATE] Insert result rows:", insertResult.rows);
         console.log("[CLASS CREATE] Created class:", created);
-        console.log("[CLASS CREATE] Step 3: Responding with created class");
+        if (Array.isArray(students) && students.length > 0) {
+            console.log("[CLASS CREATE] Step 3: Assigning students to class");
+            const assignmentResult = await addStudentsToClass(created.id, students);
+            console.log("[CLASS CREATE] Assignment result:", assignmentResult);
+        } else {
+            console.log("[CLASS CREATE] Step 3: No students provided, skipping assignment");
+        }
+
+        console.log("[CLASS CREATE] Step 4: Responding with created class");
         res.status(201).send({ message: "Class created", class: created });
 
     } catch (error) {
@@ -531,44 +582,21 @@ app.post("/class_students", async (req, res) => {
 
     console.log("classId:", classId);
 
-    console.log("Extracting student IDs using faculty numbers from Database...");
-    try{
-        var facultyNumbers = students.map(s => s.facultyNumber || s.faculty_number).filter(Boolean);
-        console.log("facultyNumbers:", facultyNumbers);
-
-        var placeholders = facultyNumbers.map((_, i) => `$${i + 1}`).join(',');
-        console.log("placeholders:", placeholders);
-
-        var sql = `SELECT id, faculty_number FROM students WHERE faculty_number IN (${placeholders})`;
-        console.log("SQL:", sql);
-
-        var result = await pool.query(sql, facultyNumbers);
-
-        var idMap = {};
-        result.rows.forEach(row => {
-            idMap[row.id] = row.faculty_number;
-        });
-        
-        var sqlInsert = "INSERT INTO class_students (class_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
-        Object.keys(idMap).forEach(id => {
-            console.log("Student ID:", id, "Faculty Number:", idMap[id]);
-            pool.query(sqlInsert, [classId, id]);
-        });
-
-        console.log("Students successfully added to class.");
-
-        res.send({ message: "Students added to class successfully" });
-
-    }catch(error){
-        var errorMessage;
-        if(error.type === 'TypeError'){
-            errorMessage = "No students provided to be added to the database.";
-            console.error(errorMessage);
-        }else{
-            console.error("Error extracting student IDs:", error);
+    try {
+        if (!classId) {
+            return res.status(400).send({ error: "classId is required" });
+        }
+        if (!Array.isArray(students) || students.length === 0) {
+            return res.status(400).send({ error: "students array is required" });
         }
 
-        res.send({ message: "Error on adding students to class (database error)" });
+        const assignmentResult = await addStudentsToClass(classId, students);
+        console.log("[CLASS STUDENTS] Assignment result:", assignmentResult);
+
+        res.send({ message: "Students added to class successfully" });
+    } catch (error) {
+        console.error("Error adding students to class:", error);
+        res.status(500).send({ message: "Error on adding students to class (database error)" });
     }
     
 
