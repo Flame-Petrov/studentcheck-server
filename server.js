@@ -61,7 +61,12 @@ const addStudentsToClass = async (classId, students) => {
     console.log("[CLASS STUDENTS] students payload:", students);
 
     const facultyNumbers = students
-        .map(s => s.facultyNumber || s.faculty_number)
+        .map(s => {
+            if (typeof s === "string" || typeof s === "number") {
+                return String(s);
+            }
+            return s?.facultyNumber || s?.faculty_number;
+        })
         .filter(Boolean);
 
     console.log("[CLASS STUDENTS] facultyNumbers:", facultyNumbers);
