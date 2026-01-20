@@ -741,31 +741,35 @@ app.get("/get_class_id_by_name", async (req, res) => {
 
 
 // ----------------- Attendance Recording Endpoint -----------------
-// Expects body: { classId: number, studentId: number }
+// Accepts body: { class_id, student_ids } or { class_id, student_id } or { class_id, faculty_number }
 app.post("/attendance", async (req, res) => {
     logRequestStart(req);
     
-    const classId = req.body.class_id;
-    const studentIds = req.body.student_ids; // expect array of student IDs
+    const { class_id, student_ids, student_id, faculty_number } = req.body || {};
 
-    console.log("classId:", classId);
-    console.log("studentIds:", studentIds);
+    console.log("[ATTENDANCE] Body:", req.body);
+    console.log("[ATTENDANCE] class_id:", class_id);
+    console.log("[ATTENDANCE] student_ids:", student_ids);
+    console.log("[ATTENDANCE] student_id:", student_id);
+    console.log("[ATTENDANCE] faculty_number:", faculty_number);
 
-    if (!classId || !studentIds) {
-        return res.status(400).send({ error: "classId and studentIds are required" });
+    if (!class_id || (!student_ids && !student_id && !faculty_number)) {
+        console.log("[ATTENDANCE] Validation failed: missing required fields");
+        return res.status(400).send({ error: "class_id and student_id or faculty_number are required" });
     }
 
     try {
+        const classIdNum = Number(class_id);
+        if (!Number.isFinite(classIdNum) || classIdNum <= 0) {
+            return res.status(400).send({ error: "class_id must be a valid number" });
+        }
 
-        const classIdNum = Number(classId);
-        const studentIdsInt = studentIds
-            .map(value => Number(value))
-            .filter(Number.isFinite);
-
-        const uniqueIds = Array.from(new Set(studentIdsInt));
-
-        if (studentIdsInt.length === 0) {
-            return res.status(400).send({ error: "No valid studentIds provided" });
+        // Verify class exists
+        console.log("[ATTENDANCE] Checking class existence");
+        const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classIdNum]);
+        console.log("[ATTENDANCE] classCheck.rows:", classCheck.rows);
+        if (classCheck.rows.length === 0) {
+            return res.status(404).send({ error: "Class not found" });
         }
 
         const upsertSql = `
@@ -776,22 +780,73 @@ app.post("/attendance", async (req, res) => {
             RETURNING id, class_id, student_id, count
         `;
 
-        const results = [];
+        // Branch 1: array of student IDs
+        if (Array.isArray(student_ids)) {
+            console.log("[ATTENDANCE] Branch: student_ids array");
+            const studentIdsInt = student_ids
+                .map(value => Number(value))
+                .filter(Number.isFinite);
 
-        console.log("Processing attendance for student IDs:", studentIds);
-        
-        for (const studentId of uniqueIds) {
-            console.log(`Recording attendance for classId: ${classId}, studentId: ${studentId}`);
-            const { rows } = await pool.query(upsertSql, [classIdNum, studentId]);
-            results.push(rows[0]);
+            const uniqueIds = Array.from(new Set(studentIdsInt));
+
+            if (uniqueIds.length === 0) {
+                return res.status(400).send({ error: "No valid student_ids provided" });
+            }
+
+            const results = [];
+            console.log("[ATTENDANCE] Processing attendance for IDs:", uniqueIds);
+            for (const sid of uniqueIds) {
+                console.log(`[ATTENDANCE] Recording attendance class_id=${classIdNum}, student_id=${sid}`);
+                const { rows } = await pool.query(upsertSql, [classIdNum, sid]);
+                results.push(rows[0]);
+            }
+
+            console.log("[ATTENDANCE] Results:", results);
+            return res.status(200).send({ success: true, attendance: results });
         }
 
-        console.log("Attendance results:", results);
+        // Branch 2: single student_id or faculty_number
+        console.log("[ATTENDANCE] Branch: single student");
+        let resolvedStudentId = null;
 
-        res.status(201).send({ message: "Attendance processed", attendance: results });
+        if (student_id !== undefined && student_id !== null) {
+            const sid = Number(student_id);
+            if (!Number.isFinite(sid) || sid <= 0) {
+                return res.status(400).send({ error: "student_id must be a valid number" });
+            }
+            console.log("[ATTENDANCE] Looking up student by id:", sid);
+            const studentCheck = await pool.query("SELECT id FROM students WHERE id = $1", [sid]);
+            console.log("[ATTENDANCE] studentCheck.rows:", studentCheck.rows);
+            if (studentCheck.rows.length === 0) {
+                return res.status(404).send({ error: "Student not found" });
+            }
+            resolvedStudentId = sid;
+            console.log("[ATTENDANCE] Resolved student_id:", resolvedStudentId);
+        } else if (faculty_number) {
+            console.log("[ATTENDANCE] Looking up student by faculty_number:", faculty_number);
+            const studentCheck = await pool.query(
+                "SELECT id FROM students WHERE faculty_number = $1",
+                [faculty_number]
+            );
+            console.log("[ATTENDANCE] studentCheck.rows:", studentCheck.rows);
+            if (studentCheck.rows.length === 0) {
+                return res.status(404).send({ error: "Student not found" });
+            }
+            resolvedStudentId = studentCheck.rows[0].id;
+            console.log("[ATTENDANCE] Resolved student_id from faculty_number:", resolvedStudentId);
+        }
+
+        if (!resolvedStudentId) {
+            return res.status(400).send({ error: "student_id or faculty_number is required" });
+        }
+
+        console.log("[ATTENDANCE] Upserting attendance with:", { classIdNum, resolvedStudentId });
+        const { rows } = await pool.query(upsertSql, [classIdNum, resolvedStudentId]);
+        console.log("[ATTENDANCE] Result:", rows[0]);
+        return res.status(200).send({ success: true, attendance: rows[0] });
     } catch (error) {
         console.error("❌ Database error recording attendance:", error);
-        res.status(500).send({ error: "Internal server error" });
+        return res.status(500).send({ error: "Internal server error" });
     }
 });
 
