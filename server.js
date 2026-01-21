@@ -891,6 +891,49 @@ app.get("/attendance", async (req, res) => {
     }
 });
 
+// ----------------- Attendance Timestamps Endpoint -----------------
+// Query: /attendance/timestamps?class_id=...
+app.get("/attendance/timestamps", async (req, res) => {
+    logRequestStart(req);
+
+    const classId = req.query.class_id;
+    console.log("[ATTENDANCE TIMESTAMPS] class_id:", classId);
+
+    if (!classId) {
+        return res.status(400).send({ error: "class_id query parameter is required" });
+    }
+
+    const classIdNum = Number(classId);
+    if (!Number.isFinite(classIdNum) || classIdNum <= 0) {
+        return res.status(400).send({ error: "class_id must be a valid number" });
+    }
+
+    try {
+        const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classIdNum]);
+        if (classCheck.rows.length === 0) {
+            return res.status(404).send({ error: "Class not found" });
+        }
+
+        const rows = await pool.query(`
+            SELECT 
+                at.class_id,
+                at.student_id,
+                s.full_name,
+                s.faculty_number,
+                at.joined_at,
+                at.left_at
+            FROM attendance_timestamps at
+            JOIN students s ON at.student_id = s.id
+            WHERE at.class_id = $1
+            ORDER BY at.joined_at DESC
+        `, [classIdNum]);
+
+        return res.send({ timestamps: rows.rows });
+    } catch (error) {
+        console.error("❌ Database error fetching attendance timestamps:", error);
+        return res.status(500).send({ error: "Internal server error" });
+    }
+});
 
 
 
