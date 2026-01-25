@@ -1024,6 +1024,51 @@ app.get("/attendance/history", async (req, res) => {
     }
 });
 
+// ----------------- Attendance Summary Endpoint -----------------
+// Query: /attendance/summary?class_id=...
+app.get("/attendance/summary", async (req, res) => {
+    logRequestStart(req);
+
+    const classId = req.query.class_id;
+    console.log("[ATTENDANCE SUMMARY] class_id:", classId);
+
+    if (!classId) {
+        return res.status(400).send({ error: "class_id is required" });
+    }
+
+    const classIdNum = Number(classId);
+    if (!Number.isFinite(classIdNum) || classIdNum <= 0) {
+        return res.status(400).send({ error: "class_id must be a valid number" });
+    }
+
+    try {
+        const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classIdNum]);
+        if (classCheck.rows.length === 0) {
+            return res.status(404).send({ error: "Class not found" });
+        }
+
+        const { rows } = await pool.query(
+            `
+            SELECT 
+                a.student_id,
+                s.full_name,
+                s.faculty_number,
+                COALESCE(a.count, 0) AS attendance_count
+            FROM attendances a
+            JOIN students s ON a.student_id = s.id
+            WHERE a.class_id = $1
+            ORDER BY s.full_name ASC
+            `,
+            [classIdNum]
+        );
+
+        return res.status(200).send({ items: rows });
+    } catch (error) {
+        console.error("❌ Database error fetching attendance summary:", error);
+        return res.status(500).send({ error: "Internal server error" });
+    }
+});
+
 
 
 // ----------------- Remove Student from Class Endpoint -----------------
