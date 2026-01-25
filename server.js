@@ -1233,18 +1233,39 @@ app.get("/get_student_attendance_count", async (req, res) => {
 
     var classId = req.query.class_id;
     var studentId = req.query.student_id;
+    var facultyNumber = req.query.faculty_number;
 
-    console.log("classId:", classId, "studentId:", studentId);
+    console.log("classId:", classId, "studentId:", studentId, "facultyNumber:", facultyNumber);
 
-    if (!classId || !studentId) {
-        return res.status(400).send({ error: "class_id and student_id are required" });
+    if (!classId || (!studentId && !facultyNumber)) {
+        return res.status(400).send({ error: "class_id and student_id or faculty_number are required" });
     }
 
     const classIdNum = Number(classId);
-    const studentIdNum = Number(studentId);
-    if (!Number.isFinite(classIdNum) || classIdNum <= 0 || !Number.isFinite(studentIdNum) || studentIdNum <= 0) {
-        return res.status(400).send({ error: "class_id and student_id must be valid numbers" });
+    if (!Number.isFinite(classIdNum) || classIdNum <= 0) {
+        return res.status(400).send({ error: "class_id must be a valid number" });
     }
+
+    let studentIdNum = null;
+    if (studentId !== undefined && studentId !== null && String(studentId).length > 0) {
+        const parsedStudentId = Number(studentId);
+        if (!Number.isFinite(parsedStudentId) || parsedStudentId <= 0) {
+            return res.status(400).send({ error: "student_id must be a valid number" });
+        }
+        studentIdNum = parsedStudentId;
+    } else if (facultyNumber) {
+        console.log("[ATTENDANCE COUNT] Resolving student by faculty_number:", facultyNumber);
+        const studentLookup = await pool.query(
+            "SELECT id FROM students WHERE faculty_number = $1",
+            [facultyNumber]
+        );
+        console.log("[ATTENDANCE COUNT] studentLookup.rows:", studentLookup.rows);
+        if (studentLookup.rows.length === 0) {
+            return res.status(404).send({ error: "Student not found" });
+        }
+        studentIdNum = studentLookup.rows[0].id;
+    }
+    console.log("[ATTENDANCE COUNT] Using studentId:", studentIdNum);
 
     const sqlForStudentAttendance = `
         SELECT COALESCE((SELECT count FROM attendances WHERE class_id = $1 AND student_id = $2), 0) AS count
