@@ -1187,34 +1187,36 @@ app.get("/get_student_attendance_count", async (req, res) => {
     logRequestStart(req);
 
     var classId = req.query.class_id;
-    var studentId = req.query.student_id;;
+    var studentId = req.query.student_id;
 
     console.log("classId:", classId, "studentId:", studentId);
 
-    const sqlForStudentAttendance = `SELECT count FROM attendances WHERE class_id = $1 AND student_id = $2`;
+    if (!classId || !studentId) {
+        return res.status(400).send({ error: "class_id and student_id are required" });
+    }
 
-    const sqlForTotalCompletedClasses = `SELECT completed_classes_count FROM classes WHERE id = $1`;
+    const classIdNum = Number(classId);
+    const studentIdNum = Number(studentId);
+    if (!Number.isFinite(classIdNum) || classIdNum <= 0 || !Number.isFinite(studentIdNum) || studentIdNum <= 0) {
+        return res.status(400).send({ error: "class_id and student_id must be valid numbers" });
+    }
 
-    const result  = await pool.query(sqlForStudentAttendance, [classId, studentId]);
-    const result2 = await pool.query(sqlForTotalCompletedClasses, [classId]);
+    const sqlForStudentAttendance = `
+        SELECT COALESCE((SELECT count FROM attendances WHERE class_id = $1 AND student_id = $2), 0) AS count
+    `;
+
+    const sqlForTotalCompletedClasses = `
+        SELECT COALESCE(completed_classes_count, 0) AS completed_classes_count FROM classes WHERE id = $1
+    `;
+
+    const result  = await pool.query(sqlForStudentAttendance, [classIdNum, studentIdNum]);
+    const result2 = await pool.query(sqlForTotalCompletedClasses, [classIdNum]);
 
     console.log('Query result:', result.rows);
     console.log('Query result 2:', result2.rows);
 
-    let attendanceCount = 0;
-    let totalCompletedClassesCount = 0;
-
-    try{
-        attendanceCount = result.rows[0].count;
-    }catch(error){
-        console.log("Error extracting attendanceCount or totalCompletedClassesCount:", error);
-    }
-
-    try{
-        totalCompletedClassesCount = result2.rows[0].completed_classes_count;
-    }catch(error){
-        console.log("Error extracting totalCompletedClassesCount:", error);
-    }
+    const attendanceCount = Number(result.rows[0]?.count ?? 0);
+    const totalCompletedClassesCount = Number(result2.rows[0]?.completed_classes_count ?? 0);
     
 
     console.log("Attendance count:", attendanceCount);
