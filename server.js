@@ -289,11 +289,34 @@ app.post("/registration", async (req, res) => {
         const user = req.body;
         const fullName = `${user.firstName} ${user.middleName || ''} ${user.lastName}`.replace(/\s+/g, ' ').trim();
 
-                const result = await pool.query(
-                    // syntax for reserved word "group" needs quotes
-                    "INSERT INTO students (full_name, email, faculty_number, password, level, faculty, specialization, \"group\", created) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, full_name, email, faculty_number, created, \"group\"",
-                    [fullName, user.email, user.facultyNumber, user.password, user.level, user.faculty, user.specialization, user.group, new Date()]
-                );
+        const courseValue = user.course;
+        const groupValue = user.group;
+        const validCourses = ["1", "2", "3", "4"];
+        const validGroups = ["37", "38", "39", "40", "41", "42"];
+
+        if (courseValue === undefined || courseValue === null || !validCourses.includes(String(courseValue))) {
+            return res.status(400).send({ message: "Invalid course. Must be 1–4." });
+        }
+        if (groupValue === undefined || groupValue === null || !validGroups.includes(String(groupValue))) {
+            return res.status(400).send({ message: "Invalid group. Must be 37–42." });
+        }
+
+        const result = await pool.query(
+            // syntax for reserved word "group" needs quotes
+            "INSERT INTO students (full_name, email, faculty_number, password, level, faculty, specialization, \"group\", course, created) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING full_name, email, faculty_number, \"group\", course, faculty, level, specialization",
+            [
+                fullName,
+                user.email,
+                user.facultyNumber,
+                user.password,
+                user.level,
+                user.faculty,
+                user.specialization,
+                String(groupValue),
+                String(courseValue),
+                new Date()
+            ]
+        );
 
         const student = result.rows[0]; // inserted record without sensitive fields
         return res.send({ message: "User registration successful", student, registrationSuccess: true });
