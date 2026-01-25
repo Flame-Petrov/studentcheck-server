@@ -1247,32 +1247,21 @@ app.get("/get_student_attendance_count", async (req, res) => {
     }
 
     let studentIdNum = null;
-    let resolveFacultyNumber = null;
+    const resolveFacultyNumber = facultyNumber || studentId;
 
-    if (studentId !== undefined && studentId !== null && String(studentId).length > 0) {
-        const parsedStudentId = Number(studentId);
-        if (Number.isFinite(parsedStudentId) && parsedStudentId > 0) {
-            studentIdNum = parsedStudentId;
-        } else {
-            resolveFacultyNumber = String(studentId);
-        }
-    }
-
-    if (!studentIdNum && facultyNumber) {
-        resolveFacultyNumber = String(facultyNumber);
-    }
-
-    if (!studentIdNum && resolveFacultyNumber) {
+    if (resolveFacultyNumber) {
         console.log("[ATTENDANCE COUNT] Resolving student by faculty_number:", resolveFacultyNumber);
         const studentLookup = await pool.query(
             "SELECT id FROM students WHERE faculty_number = $1",
-            [resolveFacultyNumber]
+            [String(resolveFacultyNumber)]
         );
         console.log("[ATTENDANCE COUNT] studentLookup.rows:", studentLookup.rows);
         if (studentLookup.rows.length === 0) {
             return res.status(404).send({ error: "Student not found" });
         }
         studentIdNum = studentLookup.rows[0].id;
+    } else {
+        return res.status(400).send({ error: "student_id or faculty_number is required" });
     }
     console.log("[ATTENDANCE COUNT] Using studentId:", studentIdNum);
 
