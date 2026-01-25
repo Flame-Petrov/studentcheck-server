@@ -958,6 +958,72 @@ app.get("/attendance/timestamps", async (req, res) => {
     }
 });
 
+// ----------------- Attendance History Endpoint -----------------
+// Query: /attendance/history?class_id=...&student_id=...&faculty_number=...
+app.get("/attendance/history", async (req, res) => {
+    logRequestStart(req);
+
+    const { class_id, student_id, faculty_number } = req.query || {};
+    console.log("[ATTENDANCE HISTORY] class_id:", class_id);
+    console.log("[ATTENDANCE HISTORY] student_id:", student_id);
+    console.log("[ATTENDANCE HISTORY] faculty_number:", faculty_number);
+
+    if (!class_id) {
+        return res.status(400).send({ error: "class_id is required" });
+    }
+
+    const classIdNum = Number(class_id);
+    if (!Number.isFinite(classIdNum) || classIdNum <= 0) {
+        return res.status(400).send({ error: "class_id must be a valid number" });
+    }
+
+    try {
+        let resolvedStudentId = null;
+
+        if (student_id !== undefined && student_id !== null && String(student_id).length > 0) {
+            const sid = Number(student_id);
+            if (!Number.isFinite(sid) || sid <= 0) {
+                return res.status(400).send({ error: "student_id must be a valid number" });
+            }
+            resolvedStudentId = sid;
+            console.log("[ATTENDANCE HISTORY] Using student_id:", resolvedStudentId);
+        } else if (faculty_number) {
+            console.log("[ATTENDANCE HISTORY] Resolving student by faculty_number:", faculty_number);
+            const studentCheck = await pool.query(
+                "SELECT id FROM students WHERE faculty_number = $1",
+                [faculty_number]
+            );
+            if (studentCheck.rows.length === 0) {
+                return res.status(404).send({ error: "Student not found" });
+            }
+            resolvedStudentId = studentCheck.rows[0].id;
+            console.log("[ATTENDANCE HISTORY] Resolved student_id:", resolvedStudentId);
+        } else {
+            return res.status(400).send({ error: "student_id or faculty_number is required" });
+        }
+
+        const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classIdNum]);
+        if (classCheck.rows.length === 0) {
+            return res.status(404).send({ error: "Class not found" });
+        }
+
+        const { rows } = await pool.query(
+            `
+            SELECT joined_at, left_at
+            FROM attendance_timestamps
+            WHERE class_id = $1 AND student_id = $2
+            ORDER BY joined_at DESC
+            `,
+            [classIdNum, resolvedStudentId]
+        );
+
+        return res.status(200).send({ records: rows });
+    } catch (error) {
+        console.error("❌ Database error fetching attendance history:", error);
+        return res.status(500).send({ error: "Internal server error" });
+    }
+});
+
 
 
 // ----------------- Remove Student from Class Endpoint -----------------
