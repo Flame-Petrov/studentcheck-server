@@ -1077,10 +1077,13 @@ app.get("/attendance/summary", async (req, res) => {
 app.post("/class_students/remove", async (req, res) => {
     logRequestStart(req);
 
-    const { class_id, faculty_number, teacherEmail } = req.body;
+    const classId = req.body.class_id ?? req.body.classId;
+    const facultyNumberRaw = req.body.faculty_number ?? req.body.facultyNumber;
+    const teacherEmail = req.body.teacherEmail;
+    const facultyNumber = facultyNumberRaw ? String(facultyNumberRaw).trim() : facultyNumberRaw;
 
     // Validate required fields
-    if (!class_id || !faculty_number) {
+    if (!classId || !facultyNumber) {
         return res.status(400).send({ error: "class_id and faculty_number are required" });
     }
     if (!teacherEmail) {
@@ -1091,7 +1094,7 @@ app.post("/class_students/remove", async (req, res) => {
         // Step 0: Get student ID from faculty number
         const studentResult = await pool.query(
             "SELECT id FROM students WHERE faculty_number = $1",
-            [faculty_number]
+            [facultyNumber]
         );
         if (studentResult.rows.length === 0) {
             return res.status(404).send({ error: "Student not found with this faculty number" });
@@ -1113,7 +1116,7 @@ app.post("/class_students/remove", async (req, res) => {
         // Step 2: Verify teacher owns the class
         const classResult = await pool.query(
             "SELECT id, teacher_id FROM classes WHERE id = $1",
-            [class_id]
+            [classId]
         );
         if (classResult.rows.length === 0) {
             return res.status(404).send({ error: "Class not found" });
@@ -1127,7 +1130,7 @@ app.post("/class_students/remove", async (req, res) => {
         // Step 3: Verify student exists in class_students
         const studentInClassResult = await pool.query(
             "SELECT id FROM class_students WHERE class_id = $1 AND student_id = $2",
-            [class_id, student_id]
+            [classId, student_id]
         );
         if (studentInClassResult.rows.length === 0) {
             return res.status(404).send({ error: "Student not found in this class" });
@@ -1137,7 +1140,7 @@ app.post("/class_students/remove", async (req, res) => {
         // Step 4: Delete the record from class_students
         const deleteResult = await pool.query(
             "DELETE FROM class_students WHERE class_id = $1 AND student_id = $2 RETURNING id",
-            [class_id, student_id]
+            [classId, student_id]
         );
         console.log("Student removed from class:", deleteResult.rows[0]);
 
