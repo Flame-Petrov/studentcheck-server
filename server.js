@@ -4,6 +4,10 @@ const DATABASE_URL = "postgresql://postgres:***REMOVED***@DB_HOST:5432/postgres"
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg"); // PostgreSQL client
+const Stripe = require("stripe");
+const { createDbAdapter } = require("./dbAdapter");
+const { createStripeService } = require("./stripeService");
+const { createBillingRouter, createBillingWebhookHandler } = require("./billingRoutes");
 
 const app = express();
 
@@ -131,8 +135,6 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(express.json());
-
 // connect to PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL, // we'll use this later
@@ -141,6 +143,20 @@ const pool = new Pool({
     rejectUnauthorized: false, // 🔒 required for Render
   },
 });
+
+const db = createDbAdapter(pool);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
+const stripeService = createStripeService({
+    stripe,
+    db,
+    appUrl: process.env.APP_URL || ""
+});
+
+// Stripe webhook must use raw body for signature verification
+app.post("/api/billing/webhook", express.raw({ type: "application/json" }), createBillingWebhookHandler(stripeService));
+
+app.use(express.json());
+app.use("/api/billing", createBillingRouter(stripeService));
 
 
 
@@ -168,6 +184,8 @@ const pool = new Pool({
             );
         `);
         console.log("🛠️ Verified tables: classes, attendances");
+        await db.ensureBillingTables();
+        console.log("🛠️ Verified tables: org_billing, stripe_events");
     client.release();
   } catch (err) {
     console.error("❌ Database connection error:", err);
