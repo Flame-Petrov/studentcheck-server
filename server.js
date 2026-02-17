@@ -160,10 +160,13 @@ app.post("/api/billing/webhook", express.raw({ type: "application/json" }), crea
 app.use(express.json());
 app.use("/api/billing", createBillingRouter(stripeService));
 
-// Flag-controlled migration for encrypted/hash fields on sensitive columns
+// Flag-controlled migration/backfill for encrypted/hash fields on sensitive columns
 const APPLY_ENCRYPTION_MIGRATION =
     String(process.env.APPLY_ENCRYPTION_MIGRATION || "").toLowerCase() === "true";
+const APPLY_ENCRYPTION_BACKFILL =
+    String(process.env.APPLY_ENCRYPTION_BACKFILL || "").toLowerCase() === "true";
 console.log("[MIGRATION] APPLY_ENCRYPTION_MIGRATION =", APPLY_ENCRYPTION_MIGRATION);
+console.log("[MIGRATION] APPLY_ENCRYPTION_BACKFILL =", APPLY_ENCRYPTION_BACKFILL);
 
 const applyEncryptionMigration = async (client) => {
     console.log("[MIGRATION] Applying encryption/hash columns migration (if needed)...");
@@ -183,6 +186,72 @@ const applyEncryptionMigration = async (client) => {
         CREATE INDEX IF NOT EXISTS idx_teachers_email_hash ON teachers (email_hash);
     `);
     console.log("[MIGRATION] Encryption/hash columns migration completed (or already in place).");
+};
+
+const backfillEncryptionForExistingData = async (client) => {
+    console.log("[BACKFILL] Starting backfill for students/teachers encrypted + hash fields...");
+
+    // Backfill students
+    const { rows: studentRows } = await client.query(`
+        SELECT id, email, faculty_number
+        FROM students
+        WHERE (email IS NOT NULL AND email_hash IS NULL)
+           OR (faculty_number IS NOT NULL AND faculty_number_hash IS NULL)
+    `);
+
+    for (const row of studentRows) {
+        const updates = {};
+
+        if (row.email) {
+            const normEmail = normalize(row.email);
+            updates.email_encrypted = encrypt(normEmail);
+            updates.email_hash = hashForLookup(normEmail);
+        }
+        if (row.faculty_number) {
+            const normFac = normalize(row.faculty_number);
+            updates.faculty_number_encrypted = encrypt(normFac);
+            updates.faculty_number_hash = hashForLookup(normFac);
+        }
+
+        const fields = Object.keys(updates);
+        if (fields.length === 0) continue;
+
+        const setFragments = fields.map((field, idx) => `${field} = $${idx + 1}`);
+        const values = fields.map((field) => updates[field]);
+        values.push(row.id);
+
+        await client.query(
+            `UPDATE students SET ${setFragments.join(", ")} WHERE id = $${fields.length + 1}`,
+            values
+        );
+    }
+    console.log(`[BACKFILL] Students processed: ${studentRows.length}`);
+
+    // Backfill teachers
+    const { rows: teacherRows } = await client.query(`
+        SELECT id, email
+        FROM teachers
+        WHERE email IS NOT NULL AND email_hash IS NULL
+    `);
+
+    for (const row of teacherRows) {
+        const normEmail = normalize(row.email);
+        const emailEncrypted = encrypt(normEmail);
+        const emailHash = hashForLookup(normEmail);
+
+        await client.query(
+            `
+            UPDATE teachers
+            SET email_encrypted = $1,
+                email_hash = $2
+            WHERE id = $3
+            `,
+            [emailEncrypted, emailHash, row.id]
+        );
+    }
+    console.log(`[BACKFILL] Teachers processed: ${teacherRows.length}`);
+
+    console.log("[BACKFILL] Backfill completed.");
 };
 
 
@@ -217,6 +286,11 @@ const applyEncryptionMigration = async (client) => {
             await applyEncryptionMigration(client);
         } else {
             console.log("[MIGRATION] APPLY_ENCRYPTION_MIGRATION=false, skipping encryption/hash migration.");
+        }
+        if (APPLY_ENCRYPTION_BACKFILL) {
+            await backfillEncryptionForExistingData(client);
+        } else {
+            console.log("[BACKFILL] APPLY_ENCRYPTION_BACKFILL=false, skipping encryption/hash backfill.");
         }
     client.release();
   } catch (err) {
