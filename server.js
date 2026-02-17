@@ -8,6 +8,8 @@ const Stripe = require("stripe");
 const { createDbAdapter } = require("./dbAdapter");
 const { createStripeService } = require("./stripeService");
 const { createBillingRouter, createBillingWebhookHandler } = require("./billingRoutes");
+const { encrypt, hashForLookup, normalize } = require("./security/cryptoService");
+const { inflateStudent } = require("./security/decryptors");
 
 const app = express();
 
@@ -158,6 +160,29 @@ app.post("/api/billing/webhook", express.raw({ type: "application/json" }), crea
 app.use(express.json());
 app.use("/api/billing", createBillingRouter(stripeService));
 
+// Flag-controlled migration for encrypted/hash fields on sensitive columns
+const APPLY_ENCRYPTION_MIGRATION = process.env.APPLY_ENCRYPTION_MIGRATION === "true";
+
+const applyEncryptionMigration = async (client) => {
+    console.log("[MIGRATION] Applying encryption/hash columns migration (if needed)...");
+    await client.query(`
+        ALTER TABLE students
+          ADD COLUMN IF NOT EXISTS email_encrypted TEXT,
+          ADD COLUMN IF NOT EXISTS email_hash TEXT,
+          ADD COLUMN IF NOT EXISTS faculty_number_encrypted TEXT,
+          ADD COLUMN IF NOT EXISTS faculty_number_hash TEXT;
+
+        ALTER TABLE teachers
+          ADD COLUMN IF NOT EXISTS email_encrypted TEXT,
+          ADD COLUMN IF NOT EXISTS email_hash TEXT;
+
+        CREATE INDEX IF NOT EXISTS idx_students_email_hash ON students (email_hash);
+        CREATE INDEX IF NOT EXISTS idx_students_faculty_number_hash ON students (faculty_number_hash);
+        CREATE INDEX IF NOT EXISTS idx_teachers_email_hash ON teachers (email_hash);
+    `);
+    console.log("[MIGRATION] Encryption/hash columns migration completed (or already in place).");
+};
+
 
 
 
@@ -186,6 +211,11 @@ app.use("/api/billing", createBillingRouter(stripeService));
         console.log("🛠️ Verified tables: classes, attendances");
         await db.ensureBillingTables();
         console.log("🛠️ Verified tables: org_billing, stripe_events");
+        if (APPLY_ENCRYPTION_MIGRATION) {
+            await applyEncryptionMigration(client);
+        } else {
+            console.log("[MIGRATION] APPLY_ENCRYPTION_MIGRATION=false, skipping encryption/hash migration.");
+        }
     client.release();
   } catch (err) {
     console.error("❌ Database connection error:", err);
@@ -213,10 +243,13 @@ app.post("/teacherLogin", async (req, res) => {
 
         console.log("🔐 Checking teacher credentials for email:", email)
         
+        const emailNorm = normalize(email);
+        const emailHash = hashForLookup(emailNorm);
+
         // Query database to check if teacher exists with matching credentials
         const result = await pool.query(
-            "SELECT * FROM teachers WHERE email = $1 AND password = $2",
-            [email, password]
+            "SELECT * FROM teachers WHERE email_hash = $1 AND password = $2",
+            [emailHash, password]
         );
 
         if (result.rows.length > 0) {
@@ -265,10 +298,13 @@ app.post("/studentLogin", async (req, res) => {
 
         console.log("🔐 Checking student credentials for faculty number:", facultyNumber);
 
+        const facultyNorm = normalize(facultyNumber);
+        const facultyHash = hashForLookup(facultyNorm);
+
         // Query database to check if student exists with matching credentials
         const result = await pool.query(
-            "SELECT * FROM students WHERE faculty_number = $1 AND password = $2",
-            [facultyNumber, password]
+            "SELECT * FROM students WHERE faculty_number_hash = $1 AND password = $2",
+            [facultyHash, password]
         );
 
         if (result.rows.length > 0) {
@@ -319,9 +355,38 @@ app.post("/registration", async (req, res) => {
             return res.status(400).send({ message: "Invalid group. Must be 37–42." });
         }
 
+        const normalizedEmail = normalize(user.email);
+        const normalizedFacultyNumber = normalize(user.facultyNumber);
+
+        const emailEncrypted = encrypt(normalizedEmail);
+        const emailHash = hashForLookup(normalizedEmail);
+
+        const facultyEncrypted = encrypt(normalizedFacultyNumber);
+        const facultyHash = hashForLookup(normalizedFacultyNumber);
+
         const result = await pool.query(
             // syntax for reserved word "group" needs quotes
-            "INSERT INTO students (full_name, email, faculty_number, password, level, faculty, specialization, \"group\", course, created) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING full_name, email, faculty_number, \"group\", course, faculty, level, specialization",
+            `
+            INSERT INTO students (
+                full_name,
+                email,
+                faculty_number,
+                password,
+                level,
+                faculty,
+                specialization,
+                "group",
+                course,
+                created,
+                email_encrypted,
+                email_hash,
+                faculty_number_encrypted,
+                faculty_number_hash
+            ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+            )
+            RETURNING full_name, email, faculty_number, "group", course, faculty, level, specialization
+            `,
             [
                 fullName,
                 user.email,
@@ -332,7 +397,11 @@ app.post("/registration", async (req, res) => {
                 user.specialization,
                 String(groupValue),
                 String(courseValue),
-                new Date()
+                new Date(),
+                emailEncrypted,
+                emailHash,
+                facultyEncrypted,
+                facultyHash,
             ]
         );
 
@@ -388,6 +457,7 @@ app.get("/students", async (req, res) => {
             const term = `%${String(search).toLowerCase()}%`;
             params.push(term);
             const placeholder = `$${params.length}`;
+            // NOTE: search still uses legacy plaintext columns for now.
             whereClauses.push(
                 `(LOWER(full_name) LIKE ${placeholder} OR LOWER(email) LIKE ${placeholder} OR LOWER(faculty_number) LIKE ${placeholder})`
             );
@@ -397,7 +467,8 @@ app.get("/students", async (req, res) => {
         const sql = `SELECT * FROM students ${whereSql} ORDER BY id DESC`;
 
         const result = await pool.query(sql, params);
-        return res.send({ students: result.rows });
+        const students = result.rows.map(inflateStudent);
+        return res.send({ students });
     } catch (error) {
         console.error("❌ Database error fetching students:", error);
         return res.status(500).send({ error: "Internal server error" });
@@ -426,9 +497,12 @@ app.post("/classes", async (req, res) => {
         console.log("[CLASS CREATE] Step 1: Resolve teacher by email");
         console.log("[CLASS CREATE] teacherEmail:", teacherEmail);
 
+        const teacherEmailNorm = normalize(teacherEmail);
+        const teacherEmailHash = hashForLookup(teacherEmailNorm);
+
         const teacherResult = await pool.query(
-            "SELECT id, email, full_name FROM teachers WHERE email = $1",
-            [teacherEmail]
+            "SELECT id, email, full_name FROM teachers WHERE email_hash = $1",
+            [teacherEmailHash]
         );
 
         console.log("[CLASS CREATE] teacherResult.rows.length:", teacherResult.rows.length);
@@ -476,7 +550,9 @@ app.get("/classes", async (req, res) => {
     const { teacherEmail } = req.query;
     try {
         if (teacherEmail) {
-            const t = await pool.query("SELECT id FROM teachers WHERE email = $1", [teacherEmail]);
+            const teacherEmailNorm = normalize(teacherEmail);
+            const teacherEmailHash = hashForLookup(teacherEmailNorm);
+            const t = await pool.query("SELECT id FROM teachers WHERE email_hash = $1", [teacherEmailHash]);
             if (t.rows.length === 0) {
                 return res.status(404).send({ error: "Teacher not found" });
             }
@@ -515,9 +591,11 @@ app.put("/classes", async (req, res) => {
     }
 
     try {
+        const teacherEmailNorm = normalize(teacherEmail);
+        const teacherEmailHash = hashForLookup(teacherEmailNorm);
         const teacherResult = await pool.query(
-            "SELECT id FROM teachers WHERE email = $1",
-            [teacherEmail]
+            "SELECT id FROM teachers WHERE email_hash = $1",
+            [teacherEmailHash]
         );
         if (teacherResult.rows.length === 0) {
             return res.status(404).send({ error: "Teacher not found" });
@@ -570,9 +648,11 @@ app.delete("/classes", async (req, res) => {
     try {
         await client.query("BEGIN");
 
+        const teacherEmailNorm = normalize(teacherEmail);
+        const teacherEmailHash = hashForLookup(teacherEmailNorm);
         const teacherResult = await client.query(
-            "SELECT id FROM teachers WHERE email = $1",
-            [teacherEmail]
+            "SELECT id FROM teachers WHERE email_hash = $1",
+            [teacherEmailHash]
         );
         if (teacherResult.rows.length === 0) {
             await client.query("ROLLBACK");
@@ -865,9 +945,11 @@ app.post("/attendance", async (req, res) => {
             console.log("[ATTENDANCE] Resolved student_id:", resolvedStudentId);
         } else if (faculty_number) {
             console.log("[ATTENDANCE] Looking up student by faculty_number:", faculty_number);
+            const facNorm = normalize(faculty_number);
+            const facHash = hashForLookup(facNorm);
             const studentCheck = await pool.query(
-                "SELECT id FROM students WHERE faculty_number = $1",
-                [faculty_number]
+                "SELECT id FROM students WHERE faculty_number_hash = $1",
+                [facHash]
             );
             console.log("[ATTENDANCE] studentCheck.rows:", studentCheck.rows);
             if (studentCheck.rows.length === 0) {
@@ -1007,9 +1089,11 @@ app.get("/attendance/history", async (req, res) => {
             console.log("[ATTENDANCE HISTORY] Using student_id:", resolvedStudentId);
         } else if (faculty_number) {
             console.log("[ATTENDANCE HISTORY] Resolving student by faculty_number:", faculty_number);
+            const facNorm = normalize(faculty_number);
+            const facHash = hashForLookup(facNorm);
             const studentCheck = await pool.query(
-                "SELECT id FROM students WHERE faculty_number = $1",
-                [faculty_number]
+                "SELECT id FROM students WHERE faculty_number_hash = $1",
+                [facHash]
             );
             if (studentCheck.rows.length === 0) {
                 return res.status(404).send({ error: "Student not found" });
@@ -1109,10 +1193,12 @@ app.post("/class_students/remove", async (req, res) => {
     }
 
     try {
-        // Step 0: Get student ID from faculty number
+        // Step 0: Get student ID from faculty number (hashed lookup)
+        const facultyNorm = normalize(facultyNumber);
+        const facultyHash = hashForLookup(facultyNorm);
         const studentResult = await pool.query(
-            "SELECT id FROM students WHERE faculty_number = $1",
-            [facultyNumber]
+            "SELECT id FROM students WHERE faculty_number_hash = $1",
+            [facultyHash]
         );
         if (studentResult.rows.length === 0) {
             return res.status(404).send({ error: "Student not found with this faculty number" });
@@ -1200,8 +1286,12 @@ app.post("/save_student_timestamps", async (req, res) => {
     var classId = req.body.class_id;
     var studentFacultyNumber = req.body.faculty_number;
 
+    const facNorm = normalize(studentFacultyNumber);
+    const facHash = hashForLookup(facNorm);
+
     const studentIdQueryResult = await pool.query(
-        "SELECT id FROM students WHERE faculty_number = $1", [studentFacultyNumber]
+        "SELECT id FROM students WHERE faculty_number_hash = $1",
+        [facHash]
     );
 
     const studentId = Number(studentIdQueryResult.rows[0].id);
@@ -1272,9 +1362,11 @@ app.get("/get_student_attendance_count", async (req, res) => {
 
     if (resolveFacultyNumber) {
         console.log("[ATTENDANCE COUNT] Resolving student by faculty_number:", resolveFacultyNumber);
+        const facNorm = normalize(resolveFacultyNumber);
+        const facHash = hashForLookup(facNorm);
         const studentLookup = await pool.query(
-            "SELECT id FROM students WHERE faculty_number = $1",
-            [String(resolveFacultyNumber)]
+            "SELECT id FROM students WHERE faculty_number_hash = $1",
+            [facHash]
         );
         console.log("[ATTENDANCE COUNT] studentLookup.rows:", studentLookup.rows);
         if (studentLookup.rows.length === 0) {
