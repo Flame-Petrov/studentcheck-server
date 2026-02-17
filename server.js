@@ -161,7 +161,9 @@ app.use(express.json());
 app.use("/api/billing", createBillingRouter(stripeService));
 
 // Flag-controlled migration for encrypted/hash fields on sensitive columns
-const APPLY_ENCRYPTION_MIGRATION = process.env.APPLY_ENCRYPTION_MIGRATION === "true";
+const APPLY_ENCRYPTION_MIGRATION =
+    String(process.env.APPLY_ENCRYPTION_MIGRATION || "").toLowerCase() === "true";
+console.log("[MIGRATION] APPLY_ENCRYPTION_MIGRATION =", APPLY_ENCRYPTION_MIGRATION);
 
 const applyEncryptionMigration = async (client) => {
     console.log("[MIGRATION] Applying encryption/hash columns migration (if needed)...");
