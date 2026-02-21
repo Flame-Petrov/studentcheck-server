@@ -9,7 +9,7 @@ const { createDbAdapter } = require("./dbAdapter");
 const { createStripeService } = require("./stripeService");
 const { createBackupHandlers } = require("./backupService");
 const { createBillingRouter, createBillingWebhookHandler } = require("./billingRoutes");
-const { encrypt, hashForLookup, normalize } = require("./security/cryptoService");
+const { encryptRaw, decrypt, hashForLookup, hashExactForLookup, normalize } = require("./security/cryptoService");
 const { inflateStudent } = require("./security/decryptors");
 
 const app = express();
@@ -176,42 +176,92 @@ const applyEncryptionMigration = async (client) => {
           ADD COLUMN IF NOT EXISTS email_encrypted TEXT,
           ADD COLUMN IF NOT EXISTS email_hash TEXT,
           ADD COLUMN IF NOT EXISTS faculty_number_encrypted TEXT,
-          ADD COLUMN IF NOT EXISTS faculty_number_hash TEXT;
+          ADD COLUMN IF NOT EXISTS faculty_number_hash TEXT,
+          ADD COLUMN IF NOT EXISTS password_hash TEXT;
 
         ALTER TABLE teachers
           ADD COLUMN IF NOT EXISTS email_encrypted TEXT,
-          ADD COLUMN IF NOT EXISTS email_hash TEXT;
+          ADD COLUMN IF NOT EXISTS email_hash TEXT,
+          ADD COLUMN IF NOT EXISTS password_hash TEXT;
 
         CREATE INDEX IF NOT EXISTS idx_students_email_hash ON students (email_hash);
         CREATE INDEX IF NOT EXISTS idx_students_faculty_number_hash ON students (faculty_number_hash);
+        CREATE INDEX IF NOT EXISTS idx_students_password_hash ON students (password_hash);
         CREATE INDEX IF NOT EXISTS idx_teachers_email_hash ON teachers (email_hash);
+        CREATE INDEX IF NOT EXISTS idx_teachers_password_hash ON teachers (password_hash);
     `);
     console.log("[MIGRATION] Encryption/hash columns migration completed (or already in place).");
 };
 
-const backfillEncryptionForExistingData = async (client) => {
-    console.log("[BACKFILL] Starting backfill for students/teachers encrypted + hash fields...");
+const getPlainTextFromPossiblyEncrypted = (value) => {
+    const raw = String(value || "");
+    if (!raw) return { plainText: "", wasEncrypted: false };
 
-    // Backfill students
+    try {
+        return {
+            plainText: decrypt(raw),
+            wasEncrypted: true,
+        };
+    } catch {
+        return {
+            plainText: raw,
+            wasEncrypted: false,
+        };
+    }
+};
+
+const backfillEncryptionForExistingData = async (client) => {
+    console.log("[BACKFILL] Starting backfill for students/teachers encrypted + hash fields (email/password + faculty)...");
+
     const { rows: studentRows } = await client.query(`
-        SELECT id, email, faculty_number
+        SELECT
+            id,
+            email,
+            email_encrypted,
+            email_hash,
+            faculty_number,
+            faculty_number_encrypted,
+            faculty_number_hash,
+            password,
+            password_hash
         FROM students
-        WHERE (email IS NOT NULL AND email_hash IS NULL)
-           OR (faculty_number IS NOT NULL AND faculty_number_hash IS NULL)
+        WHERE email IS NOT NULL
+           OR faculty_number IS NOT NULL
+           OR password IS NOT NULL
     `);
 
+    let studentsUpdated = 0;
     for (const row of studentRows) {
         const updates = {};
 
         if (row.email) {
-            const normEmail = normalize(row.email);
-            updates.email_encrypted = encrypt(normEmail);
-            updates.email_hash = hashForLookup(normEmail);
+            const { plainText: emailPlain, wasEncrypted: emailWasEncrypted } =
+                getPlainTextFromPossiblyEncrypted(row.email);
+            const emailNorm = normalize(emailPlain);
+            if (emailNorm && (!row.email_hash || !row.email_encrypted || !emailWasEncrypted)) {
+                const emailEncrypted = encryptRaw(emailNorm);
+                updates.email = emailEncrypted;
+                updates.email_encrypted = emailEncrypted;
+                updates.email_hash = hashForLookup(emailNorm);
+            }
         }
+
         if (row.faculty_number) {
-            const normFac = normalize(row.faculty_number);
-            updates.faculty_number_encrypted = encrypt(normFac);
-            updates.faculty_number_hash = hashForLookup(normFac);
+            const { plainText: facultyPlain } = getPlainTextFromPossiblyEncrypted(row.faculty_number);
+            const facultyNorm = normalize(facultyPlain);
+            if (facultyNorm && (!row.faculty_number_hash || !row.faculty_number_encrypted)) {
+                updates.faculty_number_encrypted = encryptRaw(facultyNorm);
+                updates.faculty_number_hash = hashForLookup(facultyNorm);
+            }
+        }
+
+        if (row.password) {
+            const { plainText: passwordPlain, wasEncrypted: passwordWasEncrypted } =
+                getPlainTextFromPossiblyEncrypted(row.password);
+            if (passwordPlain && (!row.password_hash || !passwordWasEncrypted)) {
+                updates.password = encryptRaw(passwordPlain);
+                updates.password_hash = hashExactForLookup(passwordPlain);
+            }
         }
 
         const fields = Object.keys(updates);
@@ -225,32 +275,62 @@ const backfillEncryptionForExistingData = async (client) => {
             `UPDATE students SET ${setFragments.join(", ")} WHERE id = $${fields.length + 1}`,
             values
         );
+        studentsUpdated += 1;
     }
-    console.log(`[BACKFILL] Students processed: ${studentRows.length}`);
+    console.log(`[BACKFILL] Students checked: ${studentRows.length}, updated: ${studentsUpdated}`);
 
-    // Backfill teachers
     const { rows: teacherRows } = await client.query(`
-        SELECT id, email
+        SELECT
+            id,
+            email,
+            email_encrypted,
+            email_hash,
+            password,
+            password_hash
         FROM teachers
-        WHERE email IS NOT NULL AND email_hash IS NULL
+        WHERE email IS NOT NULL
+           OR password IS NOT NULL
     `);
 
+    let teachersUpdated = 0;
     for (const row of teacherRows) {
-        const normEmail = normalize(row.email);
-        const emailEncrypted = encrypt(normEmail);
-        const emailHash = hashForLookup(normEmail);
+        const updates = {};
+
+        if (row.email) {
+            const { plainText: emailPlain, wasEncrypted: emailWasEncrypted } =
+                getPlainTextFromPossiblyEncrypted(row.email);
+            const emailNorm = normalize(emailPlain);
+            if (emailNorm && (!row.email_hash || !row.email_encrypted || !emailWasEncrypted)) {
+                const emailEncrypted = encryptRaw(emailNorm);
+                updates.email = emailEncrypted;
+                updates.email_encrypted = emailEncrypted;
+                updates.email_hash = hashForLookup(emailNorm);
+            }
+        }
+
+        if (row.password) {
+            const { plainText: passwordPlain, wasEncrypted: passwordWasEncrypted } =
+                getPlainTextFromPossiblyEncrypted(row.password);
+            if (passwordPlain && (!row.password_hash || !passwordWasEncrypted)) {
+                updates.password = encryptRaw(passwordPlain);
+                updates.password_hash = hashExactForLookup(passwordPlain);
+            }
+        }
+
+        const fields = Object.keys(updates);
+        if (fields.length === 0) continue;
+
+        const setFragments = fields.map((field, idx) => `${field} = $${idx + 1}`);
+        const values = fields.map((field) => updates[field]);
+        values.push(row.id);
 
         await client.query(
-            `
-            UPDATE teachers
-            SET email_encrypted = $1,
-                email_hash = $2
-            WHERE id = $3
-            `,
-            [emailEncrypted, emailHash, row.id]
+            `UPDATE teachers SET ${setFragments.join(", ")} WHERE id = $${fields.length + 1}`,
+            values
         );
+        teachersUpdated += 1;
     }
-    console.log(`[BACKFILL] Teachers processed: ${teacherRows.length}`);
+    console.log(`[BACKFILL] Teachers checked: ${teacherRows.length}, updated: ${teachersUpdated}`);
 
     console.log("[BACKFILL] Backfill completed.");
 };
@@ -355,50 +435,63 @@ app.post("/teacherLogin", async (req, res) => {
     try {
         const { email, password } = req.body;
 
-        // Validate input
         if (!email || !password) {
-            return res.status(400).send({ 
-                error: "Email and password are required" 
+            return res.status(400).send({
+                error: "Email and password are required"
             });
         }
 
-        console.log("🔐 Checking teacher credentials for email:", email)
-        
+        console.log("[AUTH] Checking teacher credentials");
+
         const emailNorm = normalize(email);
         const emailHash = hashForLookup(emailNorm);
+        const passwordHash = hashExactForLookup(password);
 
-        // Query database to check if teacher exists with matching credentials
         const result = await pool.query(
-            "SELECT * FROM teachers WHERE email_hash = $1 AND password = $2",
-            [emailHash, password]
+            `
+            SELECT id, full_name, email, email_encrypted
+            FROM teachers
+            WHERE email_hash = $1
+              AND password_hash = $2
+            LIMIT 1
+            `,
+            [emailHash, passwordHash]
         );
 
         if (result.rows.length > 0) {
-            console.log("✅ Teacher login successful");
             const teacher = result.rows[0];
-            res.send({ 
-                message: "Teacher login successful", 
+            let teacherEmail = teacher.email;
+
+            try {
+                if (teacher.email_encrypted) {
+                    teacherEmail = decrypt(teacher.email_encrypted);
+                } else if (teacher.email) {
+                    teacherEmail = decrypt(teacher.email);
+                }
+            } catch {
+                // Fallback to stored value if decryption is not applicable.
+            }
+
+            return res.send({
+                message: "Teacher login successful",
                 teacher: {
-                    email: teacher.email,
+                    email: teacherEmail,
                     fullName: teacher.full_name
                 },
                 loginSuccess: true
             });
-        } else {
-            console.log("❌ Invalid credentials");
-            res.status(401).send({ 
-                error: "Invalid email or password" 
-            });
         }
 
+        return res.status(401).send({
+            error: "Invalid email or password"
+        });
     } catch (error) {
-        console.error("❌ Database error during login:", error);
-        res.status(500).send({ 
-            error: "Internal server error" 
+        console.error("[AUTH] Database error during teacher login:", error);
+        return res.status(500).send({
+            error: "Internal server error"
         });
     }
 });
-
 
 
 
@@ -410,48 +503,59 @@ app.post("/studentLogin", async (req, res) => {
     try {
         const { facultyNumber, password } = req.body;
 
-        // Validate input
         if (!facultyNumber || !password) {
-            return res.status(400).send({ 
-                error: "Faculty number and password are required" 
+            return res.status(400).send({
+                error: "Faculty number and password are required"
             });
         }
 
-        console.log("🔐 Checking student credentials for faculty number:", facultyNumber);
+        console.log("[AUTH] Checking student credentials");
 
         const facultyNorm = normalize(facultyNumber);
         const facultyHash = hashForLookup(facultyNorm);
+        const passwordHash = hashExactForLookup(password);
 
-        // Query database to check if student exists with matching credentials
         const result = await pool.query(
-            "SELECT * FROM students WHERE faculty_number_hash = $1 AND password = $2",
-            [facultyHash, password]
+            `
+            SELECT
+                id,
+                full_name,
+                email,
+                email_encrypted,
+                faculty_number,
+                faculty_number_encrypted,
+                "group",
+                course,
+                faculty,
+                level,
+                specialization
+            FROM students
+            WHERE faculty_number_hash = $1
+              AND password_hash = $2
+            LIMIT 1
+            `,
+            [facultyHash, passwordHash]
         );
 
         if (result.rows.length > 0) {
-            console.log("✅ Student login successful");
-            const student = result.rows[0];
-            res.send({ 
-                message: "Student login successful", 
-                student: student,
+            const student = inflateStudent(result.rows[0]);
+            return res.send({
+                message: "Student login successful",
+                student,
                 loginSuccess: true
-            });
-        } else {
-            console.log("❌ Invalid credentials");
-            res.status(401).send({ 
-                error: "Invalid faculty number or password" 
             });
         }
 
+        return res.status(401).send({
+            error: "Invalid faculty number or password"
+        });
     } catch (error) {
-        console.error("❌ Database error during login:", error);
-        res.status(500).send({ 
-            error: "Internal server error" 
+        console.error("[AUTH] Database error during student login:", error);
+        return res.status(500).send({
+            error: "Internal server error"
         });
     }
 });
-
-
 
 
 
@@ -476,14 +580,39 @@ app.post("/registration", async (req, res) => {
             return res.status(400).send({ message: "Invalid group. Must be 37–42." });
         }
 
+        if (!user.email || !user.facultyNumber || !user.password) {
+            return res.status(400).send({
+                message: "Email, faculty number and password are required."
+            });
+        }
+
         const normalizedEmail = normalize(user.email);
         const normalizedFacultyNumber = normalize(user.facultyNumber);
 
-        const emailEncrypted = encrypt(normalizedEmail);
+        const emailEncrypted = encryptRaw(normalizedEmail);
         const emailHash = hashForLookup(normalizedEmail);
 
-        const facultyEncrypted = encrypt(normalizedFacultyNumber);
+        const facultyEncrypted = encryptRaw(normalizedFacultyNumber);
         const facultyHash = hashForLookup(normalizedFacultyNumber);
+
+        const passwordEncrypted = encryptRaw(user.password);
+        const passwordHash = hashExactForLookup(user.password);
+
+        const duplicateCheck = await pool.query(
+            `
+            SELECT id
+            FROM students
+            WHERE email_hash = $1 OR faculty_number_hash = $2
+            LIMIT 1
+            `,
+            [emailHash, facultyHash]
+        );
+        if (duplicateCheck.rows.length > 0) {
+            return res.status(409).send({
+                error: "An account with these details already exists (email or faculty number)",
+                registrationSuccess: false
+            });
+        }
 
         const result = await pool.query(
             // syntax for reserved word "group" needs quotes
@@ -493,6 +622,7 @@ app.post("/registration", async (req, res) => {
                 email,
                 faculty_number,
                 password,
+                password_hash,
                 level,
                 faculty,
                 specialization,
@@ -504,15 +634,16 @@ app.post("/registration", async (req, res) => {
                 faculty_number_encrypted,
                 faculty_number_hash
             ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
             )
             RETURNING full_name, email, faculty_number, "group", course, faculty, level, specialization
             `,
             [
                 fullName,
-                user.email,
+                emailEncrypted,
                 user.facultyNumber,
-                user.password,
+                passwordEncrypted,
+                passwordHash,
                 user.level,
                 user.faculty,
                 user.specialization,
@@ -526,7 +657,11 @@ app.post("/registration", async (req, res) => {
             ]
         );
 
-        const student = result.rows[0]; // inserted record without sensitive fields
+        const student = {
+            ...result.rows[0],
+            email: normalizedEmail,
+            faculty_number: user.facultyNumber,
+        };
         return res.send({ message: "User registration successful", student, registrationSuccess: true });
     } catch (error) {
         // Unique violation (email or other unique columns)
@@ -578,9 +713,8 @@ app.get("/students", async (req, res) => {
             const term = `%${String(search).toLowerCase()}%`;
             params.push(term);
             const placeholder = `$${params.length}`;
-            // NOTE: search still uses legacy plaintext columns for now.
             whereClauses.push(
-                `(LOWER(full_name) LIKE ${placeholder} OR LOWER(email) LIKE ${placeholder} OR LOWER(faculty_number) LIKE ${placeholder})`
+                `(LOWER(full_name) LIKE ${placeholder} OR LOWER(faculty_number) LIKE ${placeholder})`
             );
         }
 
@@ -1328,9 +1462,11 @@ app.post("/class_students/remove", async (req, res) => {
         console.log("Student ID found:", student_id);
 
         // Step 1: Verify teacher exists and get teacher ID
+        const teacherEmailNorm = normalize(teacherEmail);
+        const teacherEmailHash = hashForLookup(teacherEmailNorm);
         const teacherResult = await pool.query(
-            "SELECT id FROM teachers WHERE email = $1",
-            [teacherEmail]
+            "SELECT id FROM teachers WHERE email_hash = $1",
+            [teacherEmailHash]
         );
         if (teacherResult.rows.length === 0) {
             return res.status(401).send({ error: "Teacher not found" });
@@ -1350,7 +1486,7 @@ app.post("/class_students/remove", async (req, res) => {
         if (classTeacherId !== teacherId) {
             return res.status(403).send({ error: "You do not have permission to modify this class" });
         }
-        console.log("Teacher ownership verified for class:", class_id);
+        console.log("Teacher ownership verified for class:", classId);
 
         // Step 3: Verify student exists in class_students
         const studentInClassResult = await pool.query(
