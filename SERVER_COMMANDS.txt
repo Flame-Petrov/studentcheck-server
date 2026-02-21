@@ -160,3 +160,13 @@ COMMAND: $env:TABLE_NAME="<tableName>"; $env:BACKUP_INPUT="<filePath>"; npm run 
 PURPOSE: Loads a specific table using environment variables instead of CLI arguments.
 ENV: TABLE_NAME, BACKUP_INPUT
 SHELL: PowerShell
+
+============================================================
+COMMAND: $env:APPLY_ENCRYPTION_MIGRATION="true"
+PURPOSE: Ensures DB has required encrypted/hash columns, including password_hash used by login.
+SHELL: PowerShell
+
+============================================================
+COMMAND: $env:APPLY_ENCRYPTION_BACKFILL="true"
+PURPOSE: Backfills existing users so email/password are encrypted and login hashes are generated.
+SHELL: PowerShell

@@ -40,6 +40,10 @@ const LOOKUP_HASH_KEY = decodeKey(
 const normalize = (value) =>
     typeof value === "string" ? value.trim().toLowerCase()
         : String(value || "").trim().toLowerCase();
+
+const toUtf8String = (value) =>
+    typeof value === "string" ? value : String(value == null ? "" : value);
+
 /**
  * Encrypt a string using AES-256-GCM.
  * Format: base64([IV(12)][TAG(16)][CIPHERTEXT])
@@ -56,6 +60,21 @@ const encrypt = (plain) => {
 
     const payload = Buffer.concat([iv, tag, encrypted]).toString("base64");
     return payload;
+};
+
+/**
+ * Encrypt without normalization (for case-sensitive fields like passwords).
+ */
+const encryptRaw = (plain) => {
+    if (plain == null) return null;
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", ENCRYPTION_KEY, iv);
+
+    const plaintext = Buffer.from(toUtf8String(plain), "utf8");
+    const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    const tag = cipher.getAuthTag();
+
+    return Buffer.concat([iv, tag, encrypted]).toString("base64");
 };
 
 /**
@@ -95,6 +114,16 @@ const hashForLookup = (value) => {
 };
 
 /**
+ * Exact HMAC-SHA256 hash (no normalization), for case-sensitive lookups.
+ */
+const hashExactForLookup = (value) => {
+    const raw = toUtf8String(value);
+    const hmac = crypto.createHmac("sha256", LOOKUP_HASH_KEY);
+    hmac.update(raw, "utf8");
+    return hmac.digest("hex");
+};
+
+/**
  * Derive a fresh AES-256 key from user password input.
  * Returns both key and a transport-safe code payload (salt + key).
  */
@@ -116,8 +145,10 @@ const generateEncryptionKeyFromPassword = (passwordInput) => {
 
 module.exports = {
     encrypt,
+    encryptRaw,
     decrypt,
     hashForLookup,
+    hashExactForLookup,
     normalize,
     generateEncryptionKeyFromPassword,
 };
