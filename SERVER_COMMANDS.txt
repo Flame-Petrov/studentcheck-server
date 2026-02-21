@@ -144,3 +144,19 @@ COMMAND: Invoke-WebRequest -Uri "https://studentcheck-server.onrender.com/backup
 PURPOSE: Directly triggers dropping encryption/hash columns through API endpoint.
 ENV (optional): BACKUP_API_KEY
 SHELL: PowerShell
+
+============================================================
+COMMAND: npm run db:load-table -- <filePath> <tableName>
+PURPOSE: Loads rows from a local backup file into the specified table through /backup/import. Missing columns/tables are created if needed. Existing rows in the table are cleared before insert.
+ENV (optional): BACKUP_BASE_URL, BACKUP_API_KEY
+
+============================================================
+COMMAND: npm run db:load-table -- <filePath> <tableName> --append
+PURPOSE: Appends rows from file into the specified table without clearing existing rows.
+ENV (optional): BACKUP_BASE_URL, BACKUP_API_KEY
+
+============================================================
+COMMAND: $env:TABLE_NAME="<tableName>"; $env:BACKUP_INPUT="<filePath>"; npm run db:load-table
+PURPOSE: Loads a specific table using environment variables instead of CLI arguments.
+ENV: TABLE_NAME, BACKUP_INPUT
+SHELL: PowerShell
