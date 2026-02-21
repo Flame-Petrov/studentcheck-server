@@ -8,7 +8,8 @@
     "restore:db": "node scripts/restoreDatabaseBackup.js",
     "backup:encrypt": "node scripts/encryptBackupData.js",
     "backup:decrypt": "node scripts/decryptBackupData.js",
-    "backup:encrypt-users": "node scripts/encryptUserFieldsBackup.js"
+    "backup:encrypt-users": "node scripts/encryptUserFieldsBackup.js",
+    "db:drop-encryption-columns": "node scripts/dropEncryptionColumns.js"
   },
   "dependencies": {
     "express": "^4.18.2",

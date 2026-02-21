@@ -411,6 +411,89 @@ const createBackupHandlers = ({ pool, logRequestStart }) => {
         }
     };
 
+    const dropEncryptionColumns = async (req, res) => {
+        logRequestStart(req);
+        if (!validateBackupKey(req, res)) return;
+
+        const confirmation = String(req.body?.confirm || "");
+        if (confirmation !== "DROP_ENCRYPTION_COLUMNS") {
+            return res.status(400).send({
+                error: "Confirmation required",
+                required: "Set body.confirm = 'DROP_ENCRYPTION_COLUMNS'",
+            });
+        }
+
+        const targetColumnsByTable = {
+            students: ["email_encrypted", "email_hash", "faculty_number_encrypted", "faculty_number_hash"],
+            teachers: ["email_encrypted", "email_hash"],
+        };
+
+        const indexesToDrop = [
+            "idx_students_email_hash",
+            "idx_students_faculty_number_hash",
+            "idx_teachers_email_hash",
+        ];
+
+        const client = await pool.connect();
+        try {
+            const columnsBeforeDrop = [];
+            for (const [tableName, columnNames] of Object.entries(targetColumnsByTable)) {
+                const { rows } = await client.query(
+                    `
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = $1
+                      AND column_name = ANY($2::text[])
+                    ORDER BY column_name ASC
+                    `,
+                    [tableName, columnNames]
+                );
+                rows.forEach((row) => {
+                    columnsBeforeDrop.push({
+                        table: tableName,
+                        column: String(row.column_name),
+                    });
+                });
+            }
+
+            await client.query("BEGIN");
+
+            await client.query(`
+                ALTER TABLE students
+                    DROP COLUMN IF EXISTS email_encrypted,
+                    DROP COLUMN IF EXISTS email_hash,
+                    DROP COLUMN IF EXISTS faculty_number_encrypted,
+                    DROP COLUMN IF EXISTS faculty_number_hash;
+
+                ALTER TABLE teachers
+                    DROP COLUMN IF EXISTS email_encrypted,
+                    DROP COLUMN IF EXISTS email_hash;
+            `);
+
+            for (const indexName of indexesToDrop) {
+                await client.query(`DROP INDEX IF EXISTS ${quoteIdentifier(indexName)}`);
+            }
+
+            await client.query("COMMIT");
+
+            return res.status(200).send({
+                message: "Encryption/hash columns removed",
+                removedColumns: columnsBeforeDrop,
+                removedIndexes: indexesToDrop,
+            });
+        } catch (error) {
+            await client.query("ROLLBACK");
+            console.error("[MIGRATION] Drop encryption columns failed:", error);
+            return res.status(500).send({
+                error: "Failed to drop encryption/hash columns",
+                details: error.message,
+            });
+        } finally {
+            client.release();
+        }
+    };
+
     const importBackup = async (req, res) => {
         logRequestStart(req);
         if (!validateBackupKey(req, res)) return;
@@ -553,6 +636,7 @@ const createBackupHandlers = ({ pool, logRequestStart }) => {
         encryptBackup,
         decryptBackup,
         encryptUserFields,
+        dropEncryptionColumns,
         importBackup,
     };
 };
