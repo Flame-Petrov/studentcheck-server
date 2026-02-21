@@ -7,6 +7,7 @@ const { Pool } = require("pg"); // PostgreSQL client
 const Stripe = require("stripe");
 const { createDbAdapter } = require("./dbAdapter");
 const { createStripeService } = require("./stripeService");
+const { createBackupHandlers } = require("./backupService");
 const { createBillingRouter, createBillingWebhookHandler } = require("./billingRoutes");
 const { encrypt, hashForLookup, normalize } = require("./security/cryptoService");
 const { inflateStudent } = require("./security/decryptors");
@@ -157,7 +158,7 @@ const stripeService = createStripeService({
 // Stripe webhook must use raw body for signature verification
 app.post("/api/billing/webhook", express.raw({ type: "application/json" }), createBillingWebhookHandler(stripeService));
 
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 app.use("/api/billing", createBillingRouter(stripeService));
 
 // Flag-controlled migration/backfill for encrypted/hash fields on sensitive columns
@@ -1551,49 +1552,18 @@ app.post("/update_completed_classes_count", async (req, res) => {
 
 
 
+const { exportBackup, downloadBackup, encryptBackup, importBackup } = createBackupHandlers({ pool, logRequestStart });
+
 // ----------------- Database Backup Export Endpoint -----------------
-// Returns all public schema tables as JSON for backup tooling.
-// Optional auth: set BACKUP_API_KEY and provide same value in x-backup-key header.
-app.get("/backup/export", async (req, res) => {
-    logRequestStart(req, { includeBody: false });
+app.get("/backup/export", exportBackup);
 
-    const configuredBackupKey = String(process.env.BACKUP_API_KEY || "");
-    if (configuredBackupKey) {
-        const providedBackupKey = String(req.headers["x-backup-key"] || "");
-        if (!providedBackupKey || providedBackupKey !== configuredBackupKey) {
-            return res.status(401).send({ error: "Unauthorized backup request" });
-        }
-    }
+// ----------------- Database Backup Download Endpoint -----------------
+app.get("/backup/download", downloadBackup);
 
-    try {
-        const { rows: tableRows } = await pool.query(`
-            SELECT tablename
-            FROM pg_tables
-            WHERE schemaname = 'public'
-            ORDER BY tablename ASC
-        `);
+// ----------------- Database Backup Encrypt Endpoint -----------------
+app.post("/backup/encrypt", encryptBackup);
 
-        const tables = {};
-
-        for (const row of tableRows) {
-            const tableName = String(row.tablename);
-            const quotedTableName = `"${tableName.replace(/"/g, "\"\"")}"`;
-            const result = await pool.query(`SELECT * FROM ${quotedTableName}`);
-            tables[tableName] = {
-                rowCount: result.rows.length,
-                rows: result.rows,
-            };
-        }
-
-        return res.status(200).send({
-            generated_at: new Date().toISOString(),
-            table_count: tableRows.length,
-            tables,
-        });
-    } catch (error) {
-        console.error("❌ Database backup export failed:", error);
-        return res.status(500).send({ error: "Internal server error" });
-    }
-});
-
+// ----------------- Database Backup Import Endpoint -----------------
+app.post("/backup/import", importBackup);
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+

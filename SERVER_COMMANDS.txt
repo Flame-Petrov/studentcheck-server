@@ -1,0 +1,96 @@
+SERVER COMMANDS REFERENCE
+Project: studentcheck-server
+
+RULE:
+Whenever a new server command is introduced, append it to this file with:
+1) the exact command
+2) its purpose
+3) required environment variables (if any)
+
+============================================================
+COMMAND: npm start
+PURPOSE: Starts the Express server (runs server.js).
+ENV: Uses project/server environment variables (DATABASE_URL, STRIPE keys, etc.).
+
+============================================================
+COMMAND: npm run backup:db
+PURPOSE: Fetches DB snapshot from /backup/export and saves:
+1) a full backup JS file in backups/
+2) per-table backup JS files in backups/<backup-name>/
+ENV (optional): BACKUP_BASE_URL, BACKUP_API_KEY
+
+============================================================
+COMMAND: npm run restore:db
+PURPOSE: Restores database from backup by calling /backup/import.
+Default behavior:
+1) loads latest backup file from backups/
+2) clears existing data in imported tables
+3) recreates missing tables/columns when needed
+4) inserts backup rows
+ENV (optional): BACKUP_BASE_URL, BACKUP_API_KEY, BACKUP_INPUT
+
+============================================================
+COMMAND: npm run restore:db -- backups/<backup-file>.js
+PURPOSE: Restores from a specific backup file instead of auto-selecting latest.
+ENV (optional): BACKUP_BASE_URL, BACKUP_API_KEY
+
+============================================================
+COMMAND: $env:BACKUP_BASE_URL="https://studentcheck-server.onrender.com"
+PURPOSE: Targets a specific server URL (for backup/restore scripts).
+SHELL: PowerShell
+
+============================================================
+COMMAND: $env:BACKUP_API_KEY="your-key"
+PURPOSE: Provides API key for protected /backup/export and /backup/import routes.
+SHELL: PowerShell
+
+============================================================
+COMMAND: $env:BACKUP_INPUT="backups/<backup-file>.js"
+PURPOSE: Forces restore script to use a specific backup file path.
+SHELL: PowerShell
+
+============================================================
+COMMAND: Invoke-WebRequest -Uri "https://studentcheck-server.onrender.com/backup/download" -OutFile "database-backup-latest.js"
+PURPOSE: Downloads a live database backup file from the server as a .js export.
+ENV (optional): BACKUP_API_KEY (if route protection is enabled)
+SHELL: PowerShell
+
+============================================================
+COMMAND: $headers = @{ "x-backup-key" = $env:BACKUP_API_KEY }; Invoke-WebRequest -Uri "https://studentcheck-server.onrender.com/backup/download" -Headers $headers -OutFile "database-backup-latest.js"
+PURPOSE: Downloads a live database backup file from the protected backup download endpoint.
+ENV: BACKUP_API_KEY
+SHELL: PowerShell
+
+============================================================
+COMMAND: Invoke-WebRequest -Uri "https://studentcheck-server.onrender.com/heartbeat" -TimeoutSec 60 -UseBasicParsing | Select-Object -ExpandProperty StatusCode
+PURPOSE: Checks whether the Render server is reachable before running backup/restore calls.
+ENV: none
+SHELL: PowerShell
+
+============================================================
+COMMAND: npm run backup:encrypt
+PURPOSE: Encrypts the latest backup file from backups/ and saves encrypted output in encrypted_data/<timestamp>.js
+ENV: BACKUP_BASE_URL (optional), BACKUP_API_KEY (optional), BACKUP_INPUT (optional backup path)
+NOTE: Encryption key is read on the server side from Render environment variables (ENCRYPTION_KEY or BACKUP_ENCRYPTION_KEY).
+
+============================================================
+COMMAND: npm run backup:encrypt -- backups/<backup-file>.js
+PURPOSE: Encrypts a specific backup file and saves encrypted output in encrypted_data/<timestamp>.js
+ENV: BACKUP_BASE_URL (optional), BACKUP_API_KEY (optional)
+NOTE: Encryption key is read on the server side from Render environment variables (ENCRYPTION_KEY or BACKUP_ENCRYPTION_KEY).
+
+============================================================
+COMMAND: Invoke-WebRequest -Uri "https://studentcheck-server.onrender.com/backup/encrypt" -Method Post -ContentType "application/json" -Body "{}"
+PURPOSE: Verifies that /backup/encrypt is deployed. Expected response when deployed: 400 (invalid payload). If 404, deployment is outdated.
+ENV (optional): BACKUP_API_KEY
+SHELL: PowerShell
+
+============================================================
+COMMAND: $env:ENCRYPTION_KEY="<base64-or-hex-32-byte-key>"
+PURPOSE: Sets the global encryption key on local runs when server-side encryption is not used.
+SHELL: PowerShell
+
+============================================================
+COMMAND: $env:BACKUP_ENCRYPTION_KEY="<base64-or-hex-32-byte-key>"
+PURPOSE: Optional override key used only for backup encryption/decryption workflows (typically set in Render env).
+SHELL: PowerShell
