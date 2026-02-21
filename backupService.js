@@ -1,6 +1,6 @@
 "use strict";
 
-const { encryptBackupObject } = require("./security/backupEncryptionService");
+const { encryptBackupObject, decryptBackupObject } = require("./security/backupEncryptionService");
 
 const BACKUP_IDENTIFIER_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 const BACKUP_COLUMN_TYPE_REGEX = /^[a-zA-Z0-9_\s(),[\]]+$/;
@@ -257,6 +257,29 @@ const createBackupHandlers = ({ pool, logRequestStart }) => {
         }
     };
 
+    const decryptBackup = async (req, res) => {
+        logRequestStart(req);
+        if (!validateBackupKey(req, res)) return;
+
+        const encryptedPayload = req.body?.payload ?? req.body?.encryptedPayload ?? req.body;
+        if (typeof encryptedPayload !== "string" || !encryptedPayload.trim()) {
+            return res.status(400).send({ error: "Invalid encrypted payload" });
+        }
+
+        try {
+            const decrypted = decryptBackupObject(encryptedPayload);
+            return res.status(200).send({
+                format: "studentcheck.decrypted-backup.v1",
+                decryptedAt: new Date().toISOString(),
+                keyReference: decrypted.keyReference,
+                backupData: decrypted.data,
+            });
+        } catch (error) {
+            console.error("[BACKUP] Decrypt failed:", error);
+            return res.status(500).send({ error: "Backup decryption failed", details: error.message });
+        }
+    };
+
     const importBackup = async (req, res) => {
         logRequestStart(req);
         if (!validateBackupKey(req, res)) return;
@@ -397,6 +420,7 @@ const createBackupHandlers = ({ pool, logRequestStart }) => {
         exportBackup,
         downloadBackup,
         encryptBackup,
+        decryptBackup,
         importBackup,
     };
 };
