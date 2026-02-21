@@ -129,3 +129,18 @@ COMMAND: Invoke-WebRequest -Uri "https://studentcheck-server.onrender.com/backup
 PURPOSE: Verifies that /backup/encrypt-user-fields is deployed. Expected response when deployed: 400 (invalid payload). If 404, deployment is outdated.
 ENV (optional): BACKUP_API_KEY
 SHELL: PowerShell
+
+============================================================
+COMMAND: npm run db:drop-encryption-columns
+PURPOSE: Sends request to remove encryption/hash columns from DB tables:
+1) students: email_encrypted, email_hash, faculty_number_encrypted, faculty_number_hash
+2) teachers: email_encrypted, email_hash
+Also drops hash indexes if they exist.
+ENV (optional): BACKUP_BASE_URL, BACKUP_API_KEY
+WARNING: App login/query logic that uses *_hash columns will fail until code/migration is updated.
+
+============================================================
+COMMAND: Invoke-WebRequest -Uri "https://studentcheck-server.onrender.com/backup/drop-encryption-columns" -Method Post -ContentType "application/json" -Body '{"confirm":"DROP_ENCRYPTION_COLUMNS"}'
+PURPOSE: Directly triggers dropping encryption/hash columns through API endpoint.
+ENV (optional): BACKUP_API_KEY
+SHELL: PowerShell

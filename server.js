@@ -1552,7 +1552,7 @@ app.post("/update_completed_classes_count", async (req, res) => {
 
 
 
-const { exportBackup, downloadBackup, encryptBackup, decryptBackup, encryptUserFields, importBackup } = createBackupHandlers({ pool, logRequestStart });
+const { exportBackup, downloadBackup, encryptBackup, decryptBackup, encryptUserFields, dropEncryptionColumns, importBackup } = createBackupHandlers({ pool, logRequestStart });
 
 // ----------------- Database Backup Export Endpoint -----------------
 app.get("/backup/export", exportBackup);
@@ -1568,6 +1568,9 @@ app.post("/backup/decrypt", decryptBackup);
 
 // ----------------- Database Backup Encrypt User Fields Endpoint -----------------
 app.post("/backup/encrypt-user-fields", encryptUserFields);
+
+// ----------------- Drop Encryption/Hash Columns Endpoint -----------------
+app.post("/backup/drop-encryption-columns", dropEncryptionColumns);
 
 // ----------------- Database Backup Import Endpoint -----------------
 app.post("/backup/import", importBackup);
