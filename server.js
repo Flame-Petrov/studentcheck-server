@@ -254,16 +254,58 @@ const backfillEncryptionForExistingData = async (client) => {
     console.log("[BACKFILL] Backfill completed.");
 };
 
+const formatServerTime = (rawTime) => {
+    const date = rawTime instanceof Date ? rawTime : new Date(rawTime);
+    if (Number.isNaN(date.getTime())) {
+        return String(rawTime);
+    }
+    return `${date.toISOString()} | Europe/Sofia: ${formatBgTime(date)}`;
+};
+
+const verifyAndPrintTables = async (client) => {
+    const requiredTables = [
+        "students",
+        "teachers",
+        "classes",
+        "class_students",
+        "attendances",
+        "attendance_timestamps",
+        "org_billing",
+        "stripe_events",
+    ];
+
+    const { rows } = await client.query(`
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = 'public'
+        ORDER BY tablename ASC
+    `);
+
+    const existingTables = new Set(rows.map((row) => String(row.tablename)));
+    console.log(`[DB] Tables discovered in public schema: ${rows.length}`);
+
+    for (const row of rows) {
+        console.log(`[DB] Table ${row.tablename}: OK`);
+    }
+
+    const missingTables = requiredTables.filter((tableName) => !existingTables.has(tableName));
+    for (const tableName of missingTables) {
+        console.log(`[DB] Table ${tableName}: MISSING`);
+    }
+};
+
 
 
 
 
 (async () => {
+  let client;
   try {
-    const client = await pool.connect();
-    console.log("✅ Connected to PostgreSQL!");
-    const result = await client.query("SELECT NOW()");
-    console.log("🕒 Server time:", result.rows[0]);
+    client = await pool.connect();
+    console.log("[DB] Connected to PostgreSQL.");
+
+    const result = await client.query("SELECT NOW() AS server_time");
+    console.log("[DB] Server time:", formatServerTime(result.rows[0]?.server_time));
         // --- Ensure required tables exist (idempotent) ---
         await client.query(`
             CREATE TABLE IF NOT EXISTS classes (
@@ -279,9 +321,8 @@ const backfillEncryptionForExistingData = async (client) => {
                 UNIQUE(class_id, student_id)
             );
         `);
-        console.log("🛠️ Verified tables: classes, attendances");
         await db.ensureBillingTables();
-        console.log("🛠️ Verified tables: org_billing, stripe_events");
+        await verifyAndPrintTables(client);
         if (APPLY_ENCRYPTION_MIGRATION) {
             await applyEncryptionMigration(client);
         } else {
@@ -292,9 +333,12 @@ const backfillEncryptionForExistingData = async (client) => {
         } else {
             console.log("[BACKFILL] APPLY_ENCRYPTION_BACKFILL=false, skipping encryption/hash backfill.");
         }
-    client.release();
   } catch (err) {
-    console.error("❌ Database connection error:", err);
+    console.error("[DB] Startup initialization error:", err);
+  } finally {
+    if (client) {
+        client.release();
+    }
   }
 })();
 
