@@ -1,0 +1,16 @@
+"use strict";
+
+const tableBackup = {
+  "meta": {
+    "createdAt": "2026-02-21T10:34:07.914Z",
+    "source": "https://studentcheck-server.onrender.com",
+    "endpoint": "/backup/export",
+    "tableCount": 9
+  },
+  "tableName": "stripe_events",
+  "columns": [],
+  "rowCount": 0,
+  "rows": []
+};
+
+module.exports = tableBackup;

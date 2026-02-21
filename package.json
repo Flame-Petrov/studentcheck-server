@@ -4,7 +4,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "backup:db": "node scripts/createDatabaseBackup.js"
+    "backup:db": "node scripts/createDatabaseBackup.js",
+    "restore:db": "node scripts/restoreDatabaseBackup.js",
+    "backup:encrypt": "node scripts/encryptBackupData.js"
   },
   "dependencies": {
     "express": "^4.18.2",
