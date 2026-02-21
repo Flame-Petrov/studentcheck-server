@@ -1507,4 +1507,49 @@ app.post("/update_completed_classes_count", async (req, res) => {
 
 
 
+// ----------------- Database Backup Export Endpoint -----------------
+// Returns all public schema tables as JSON for backup tooling.
+// Optional auth: set BACKUP_API_KEY and provide same value in x-backup-key header.
+app.get("/backup/export", async (req, res) => {
+    logRequestStart(req, { includeBody: false });
+
+    const configuredBackupKey = String(process.env.BACKUP_API_KEY || "");
+    if (configuredBackupKey) {
+        const providedBackupKey = String(req.headers["x-backup-key"] || "");
+        if (!providedBackupKey || providedBackupKey !== configuredBackupKey) {
+            return res.status(401).send({ error: "Unauthorized backup request" });
+        }
+    }
+
+    try {
+        const { rows: tableRows } = await pool.query(`
+            SELECT tablename
+            FROM pg_tables
+            WHERE schemaname = 'public'
+            ORDER BY tablename ASC
+        `);
+
+        const tables = {};
+
+        for (const row of tableRows) {
+            const tableName = String(row.tablename);
+            const quotedTableName = `"${tableName.replace(/"/g, "\"\"")}"`;
+            const result = await pool.query(`SELECT * FROM ${quotedTableName}`);
+            tables[tableName] = {
+                rowCount: result.rows.length,
+                rows: result.rows,
+            };
+        }
+
+        return res.status(200).send({
+            generated_at: new Date().toISOString(),
+            table_count: tableRows.length,
+            tables,
+        });
+    } catch (error) {
+        console.error("❌ Database backup export failed:", error);
+        return res.status(500).send({ error: "Internal server error" });
+    }
+});
+
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
