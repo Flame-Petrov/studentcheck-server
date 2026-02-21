@@ -423,6 +423,78 @@ const verifyAndPrintTables = async (client) => {
   }
 })();
 
+const tryDecryptValue = (value) => {
+    if (typeof value !== "string" || !value) return null;
+    try {
+        return decrypt(value);
+    } catch {
+        return null;
+    }
+};
+
+const identifierMatches = ({ inputNormalized, rowHash, rowPlain, rowEncrypted }) => {
+    if (!inputNormalized) return false;
+
+    if (rowHash && hashForLookup(inputNormalized) === rowHash) return true;
+
+    if (typeof rowPlain === "string" && rowPlain && normalize(rowPlain) === inputNormalized) {
+        return true;
+    }
+
+    const decryptedPlain = tryDecryptValue(rowPlain);
+    if (decryptedPlain && normalize(decryptedPlain) === inputNormalized) {
+        return true;
+    }
+
+    const decryptedEncrypted = tryDecryptValue(rowEncrypted);
+    if (decryptedEncrypted && normalize(decryptedEncrypted) === inputNormalized) {
+        return true;
+    }
+
+    return false;
+};
+
+const passwordMatches = ({ inputPassword, rowPassword, rowPasswordHash }) => {
+    if (typeof inputPassword !== "string" || !inputPassword) return false;
+
+    if (rowPasswordHash && hashExactForLookup(inputPassword) === rowPasswordHash) {
+        return true;
+    }
+
+    if (typeof rowPassword !== "string" || !rowPassword) return false;
+
+    if (rowPassword === inputPassword) {
+        return true;
+    }
+
+    const decryptedPassword = tryDecryptValue(rowPassword);
+    return Boolean(decryptedPassword && decryptedPassword === inputPassword);
+};
+
+const getResolvedEmailForResponse = (row) => {
+    const fromEncryptedColumn = tryDecryptValue(row.email_encrypted);
+    if (fromEncryptedColumn) return fromEncryptedColumn;
+
+    const fromEmailColumn = tryDecryptValue(row.email);
+    if (fromEmailColumn) return fromEmailColumn;
+
+    return row.email;
+};
+
+const updateAuthFieldsById = async (tableName, id, updates) => {
+    const fields = Object.keys(updates || {});
+    if (fields.length === 0) return;
+
+    const setSql = fields.map((field, idx) => `${field} = $${idx + 1}`).join(", ");
+    const values = fields.map((field) => updates[field]);
+    values.push(id);
+
+    await pool.query(
+        `UPDATE ${tableName} SET ${setSql} WHERE id = $${fields.length + 1}`,
+        values
+    );
+};
+
 
 
 
@@ -447,9 +519,9 @@ app.post("/teacherLogin", async (req, res) => {
         const emailHash = hashForLookup(emailNorm);
         const passwordHash = hashExactForLookup(password);
 
-        const result = await pool.query(
+        const fastResult = await pool.query(
             `
-            SELECT id, full_name, email, email_encrypted
+            SELECT id, full_name, email, email_encrypted, email_hash, password, password_hash
             FROM teachers
             WHERE email_hash = $1
               AND password_hash = $2
@@ -458,32 +530,70 @@ app.post("/teacherLogin", async (req, res) => {
             [emailHash, passwordHash]
         );
 
-        if (result.rows.length > 0) {
-            const teacher = result.rows[0];
-            let teacherEmail = teacher.email;
+        let teacher = fastResult.rows[0] || null;
 
-            try {
-                if (teacher.email_encrypted) {
-                    teacherEmail = decrypt(teacher.email_encrypted);
-                } else if (teacher.email) {
-                    teacherEmail = decrypt(teacher.email);
-                }
-            } catch {
-                // Fallback to stored value if decryption is not applicable.
-            }
+        if (!teacher) {
+            const fallbackCandidates = await pool.query(
+                `
+                SELECT id, full_name, email, email_encrypted, email_hash, password, password_hash
+                FROM teachers
+                ORDER BY id ASC
+                LIMIT 5000
+                `
+            );
 
-            return res.send({
-                message: "Teacher login successful",
-                teacher: {
-                    email: teacherEmail,
-                    fullName: teacher.full_name
-                },
-                loginSuccess: true
+            teacher = fallbackCandidates.rows.find((row) => {
+                return identifierMatches({
+                    inputNormalized: emailNorm,
+                    rowHash: row.email_hash,
+                    rowPlain: row.email,
+                    rowEncrypted: row.email_encrypted,
+                }) && passwordMatches({
+                    inputPassword: password,
+                    rowPassword: row.password,
+                    rowPasswordHash: row.password_hash,
+                });
+            }) || null;
+        }
+
+        if (!teacher) {
+            return res.status(401).send({
+                error: "Invalid email or password"
             });
         }
 
-        return res.status(401).send({
-            error: "Invalid email or password"
+        const updates = {};
+        const emailFromMainColumn = tryDecryptValue(teacher.email);
+        const passwordFromMainColumn = tryDecryptValue(teacher.password);
+
+        if (!teacher.email_hash) {
+            updates.email_hash = emailHash;
+        }
+        if (!teacher.email_encrypted) {
+            updates.email_encrypted = emailFromMainColumn ? teacher.email : encryptRaw(emailNorm);
+        }
+        if (!emailFromMainColumn) {
+            updates.email = updates.email_encrypted || encryptRaw(emailNorm);
+        }
+        if (!teacher.password_hash) {
+            updates.password_hash = passwordHash;
+        }
+        if (!passwordFromMainColumn && teacher.password === password) {
+            updates.password = encryptRaw(password);
+        }
+
+        await updateAuthFieldsById("teachers", teacher.id, updates);
+
+        return res.send({
+            message: "Teacher login successful",
+            teacher: {
+                email: getResolvedEmailForResponse({
+                    ...teacher,
+                    ...updates,
+                }),
+                fullName: teacher.full_name
+            },
+            loginSuccess: true
         });
     } catch (error) {
         console.error("[AUTH] Database error during teacher login:", error);
@@ -515,15 +625,19 @@ app.post("/studentLogin", async (req, res) => {
         const facultyHash = hashForLookup(facultyNorm);
         const passwordHash = hashExactForLookup(password);
 
-        const result = await pool.query(
+        const fastResult = await pool.query(
             `
             SELECT
                 id,
                 full_name,
                 email,
                 email_encrypted,
+                email_hash,
                 faculty_number,
                 faculty_number_encrypted,
+                faculty_number_hash,
+                password,
+                password_hash,
                 "group",
                 course,
                 faculty,
@@ -537,17 +651,103 @@ app.post("/studentLogin", async (req, res) => {
             [facultyHash, passwordHash]
         );
 
-        if (result.rows.length > 0) {
-            const student = inflateStudent(result.rows[0]);
-            return res.send({
-                message: "Student login successful",
-                student,
-                loginSuccess: true
+        let studentRow = fastResult.rows[0] || null;
+
+        if (!studentRow) {
+            const fallbackCandidates = await pool.query(
+                `
+                SELECT
+                    id,
+                    full_name,
+                    email,
+                    email_encrypted,
+                    email_hash,
+                    faculty_number,
+                    faculty_number_encrypted,
+                    faculty_number_hash,
+                    password,
+                    password_hash,
+                    "group",
+                    course,
+                    faculty,
+                    level,
+                    specialization
+                FROM students
+                ORDER BY id ASC
+                LIMIT 10000
+                `
+            );
+
+            studentRow = fallbackCandidates.rows.find((row) => {
+                return identifierMatches({
+                    inputNormalized: facultyNorm,
+                    rowHash: row.faculty_number_hash,
+                    rowPlain: row.faculty_number,
+                    rowEncrypted: row.faculty_number_encrypted,
+                }) && passwordMatches({
+                    inputPassword: password,
+                    rowPassword: row.password,
+                    rowPasswordHash: row.password_hash,
+                });
+            }) || null;
+        }
+
+        if (!studentRow) {
+            return res.status(401).send({
+                error: "Invalid faculty number or password"
             });
         }
 
-        return res.status(401).send({
-            error: "Invalid faculty number or password"
+        const updates = {};
+        const passwordFromMainColumn = tryDecryptValue(studentRow.password);
+        const emailFromMainColumn = tryDecryptValue(studentRow.email);
+        const facultyFromMainColumn = tryDecryptValue(studentRow.faculty_number);
+
+        if (!studentRow.password_hash) {
+            updates.password_hash = passwordHash;
+        }
+        if (!passwordFromMainColumn && studentRow.password === password) {
+            updates.password = encryptRaw(password);
+        }
+
+        if (!studentRow.faculty_number_hash) {
+            updates.faculty_number_hash = facultyHash;
+        }
+        if (!studentRow.faculty_number_encrypted) {
+            updates.faculty_number_encrypted = facultyFromMainColumn
+                ? studentRow.faculty_number
+                : encryptRaw(facultyNorm);
+        }
+
+        if (!studentRow.email_hash || !studentRow.email_encrypted || !emailFromMainColumn) {
+            const resolvedEmail = getResolvedEmailForResponse(studentRow);
+            const normalizedEmail = normalize(resolvedEmail || "");
+            if (normalizedEmail) {
+                if (!studentRow.email_hash) {
+                    updates.email_hash = hashForLookup(normalizedEmail);
+                }
+                if (!studentRow.email_encrypted) {
+                    updates.email_encrypted = emailFromMainColumn
+                        ? studentRow.email
+                        : encryptRaw(normalizedEmail);
+                }
+                if (!emailFromMainColumn) {
+                    updates.email = updates.email_encrypted || encryptRaw(normalizedEmail);
+                }
+            }
+        }
+
+        await updateAuthFieldsById("students", studentRow.id, updates);
+
+        const student = inflateStudent({
+            ...studentRow,
+            ...updates,
+        });
+
+        return res.send({
+            message: "Student login successful",
+            student,
+            loginSuccess: true
         });
     } catch (error) {
         console.error("[AUTH] Database error during student login:", error);
