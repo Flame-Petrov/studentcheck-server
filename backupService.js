@@ -1,6 +1,6 @@
 "use strict";
 
-const { encryptBackupObject, decryptBackupObject } = require("./security/backupEncryptionService");
+const { encryptBackupObject, decryptBackupObject, encryptText } = require("./security/backupEncryptionService");
 
 const BACKUP_IDENTIFIER_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 const BACKUP_COLUMN_TYPE_REGEX = /^[a-zA-Z0-9_\s(),[\]]+$/;
@@ -201,6 +201,111 @@ const createBackupFilename = () => {
     return `database-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.js`;
 };
 
+const encryptUserCredentialFieldsInBackup = (backupData) => {
+    if (!backupData || typeof backupData !== "object" || Array.isArray(backupData)) {
+        throw new Error("Invalid backup payload. Expected object.");
+    }
+
+    const hasTablesContainer = (
+        backupData.tables
+        && typeof backupData.tables === "object"
+        && !Array.isArray(backupData.tables)
+    );
+    const sourceTables = hasTablesContainer ? backupData.tables : backupData;
+
+    if (!sourceTables || typeof sourceTables !== "object" || Array.isArray(sourceTables)) {
+        throw new Error("Backup payload does not contain tables.");
+    }
+
+    const encryptedTables = {};
+    const tableStats = [];
+    let totalRowsProcessed = 0;
+    let emailFieldsEncrypted = 0;
+    let passwordFieldsEncrypted = 0;
+    let keyReference = process.env.BACKUP_ENCRYPTION_KEY ? "BACKUP_ENCRYPTION_KEY" : "ENCRYPTION_KEY";
+
+    for (const [tableName, tableEntry] of Object.entries(sourceTables)) {
+        const rows = Array.isArray(tableEntry)
+            ? tableEntry
+            : (tableEntry && typeof tableEntry === "object" && Array.isArray(tableEntry.rows) ? tableEntry.rows : null);
+
+        if (!rows) {
+            encryptedTables[tableName] = tableEntry;
+            continue;
+        }
+
+        let tableEmailCount = 0;
+        let tablePasswordCount = 0;
+        const encryptedRows = rows.map((row) => {
+            totalRowsProcessed += 1;
+            if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+
+            const encryptedRow = { ...row };
+
+            if (typeof encryptedRow.email === "string" && encryptedRow.email.trim()) {
+                const encryptedEmail = encryptText(encryptedRow.email);
+                encryptedRow.email = encryptedEmail.payload;
+                keyReference = encryptedEmail.keyReference || keyReference;
+                tableEmailCount += 1;
+                emailFieldsEncrypted += 1;
+            }
+
+            if (typeof encryptedRow.password === "string" && encryptedRow.password.trim()) {
+                const encryptedPassword = encryptText(encryptedRow.password);
+                encryptedRow.password = encryptedPassword.payload;
+                keyReference = encryptedPassword.keyReference || keyReference;
+                tablePasswordCount += 1;
+                passwordFieldsEncrypted += 1;
+            }
+
+            return encryptedRow;
+        });
+
+        if (Array.isArray(tableEntry)) {
+            encryptedTables[tableName] = encryptedRows;
+        } else {
+            encryptedTables[tableName] = {
+                ...tableEntry,
+                rows: encryptedRows,
+                rowCount: encryptedRows.length,
+            };
+        }
+
+        tableStats.push({
+            tableName,
+            rows: rows.length,
+            emailFieldsEncrypted: tableEmailCount,
+            passwordFieldsEncrypted: tablePasswordCount,
+        });
+    }
+
+    const transformedBackup = hasTablesContainer
+        ? {
+            ...backupData,
+            meta: {
+                ...(backupData.meta && typeof backupData.meta === "object" && !Array.isArray(backupData.meta)
+                    ? backupData.meta
+                    : {}),
+                userFieldsEncryptedAt: new Date().toISOString(),
+                userFieldsEncrypted: ["email", "password"],
+            },
+            tables: encryptedTables,
+        }
+        : encryptedTables;
+
+    return {
+        backupData: transformedBackup,
+        keyReference,
+        summary: {
+            tablesProcessed: tableStats.length,
+            totalRowsProcessed,
+            emailFieldsEncrypted,
+            passwordFieldsEncrypted,
+            tableStats,
+        },
+    };
+};
+
 const createBackupHandlers = ({ pool, logRequestStart }) => {
     const exportBackup = async (req, res) => {
         logRequestStart(req, { includeBody: false });
@@ -277,6 +382,32 @@ const createBackupHandlers = ({ pool, logRequestStart }) => {
         } catch (error) {
             console.error("[BACKUP] Decrypt failed:", error);
             return res.status(500).send({ error: "Backup decryption failed", details: error.message });
+        }
+    };
+
+    const encryptUserFields = async (req, res) => {
+        logRequestStart(req);
+        if (!validateBackupKey(req, res)) return;
+
+        const backupData = req.body?.backupData ?? req.body;
+        if (!backupData || typeof backupData !== "object" || Array.isArray(backupData)) {
+            return res.status(400).send({ error: "Invalid backupData payload" });
+        }
+
+        try {
+            const encrypted = encryptUserCredentialFieldsInBackup(backupData);
+            return res.status(200).send({
+                format: "studentcheck.encrypted-user-fields.v1",
+                encryptedAt: new Date().toISOString(),
+                keyReference: encrypted.keyReference,
+                algorithm: "aes-256-gcm",
+                fields: ["email", "password"],
+                summary: encrypted.summary,
+                backupData: encrypted.backupData,
+            });
+        } catch (error) {
+            console.error("[BACKUP] Encrypt user fields failed:", error);
+            return res.status(500).send({ error: "User fields encryption failed", details: error.message });
         }
     };
 
@@ -421,6 +552,7 @@ const createBackupHandlers = ({ pool, logRequestStart }) => {
         downloadBackup,
         encryptBackup,
         decryptBackup,
+        encryptUserFields,
         importBackup,
     };
 };
