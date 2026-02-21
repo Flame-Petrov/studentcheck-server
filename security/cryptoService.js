@@ -2,6 +2,7 @@ const crypto = require("crypto");
 
 const REQUIRED_AES_KEY_BYTES = 32; // AES-256
 const REQUIRED_HMAC_KEY_BYTES = 32;
+const PASSWORD_DERIVE_SALT_BYTES = 16;
 
 // Decode env key as hex or base64; fail fast if invalid
 function decodeKey(raw, name, requiredBytes) {
@@ -37,10 +38,8 @@ const LOOKUP_HASH_KEY = decodeKey(
 
 // Normalize for consistent hashing / encryption (e.g. emails, faculty numbers)
 const normalize = (value) =>
-    typeof value === "string"
-        ? value.trim().toLowerCase()
+    typeof value === "string" ? value.trim().toLowerCase()
         : String(value || "").trim().toLowerCase();
-
 /**
  * Encrypt a string using AES-256-GCM.
  * Format: base64([IV(12)][TAG(16)][CIPHERTEXT])
@@ -50,6 +49,7 @@ const encrypt = (plain) => {
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv("aes-256-gcm", ENCRYPTION_KEY, iv);
 
+    plain = normalize(plain);
     const plaintext = Buffer.from(String(plain), "utf8");
     const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
     const tag = cipher.getAuthTag();
@@ -62,7 +62,10 @@ const encrypt = (plain) => {
  * Decrypt a value produced by encrypt().
  */
 const decrypt = (payload) => {
-    if (!payload) return null;
+    if (!payload) {
+        console.log("decrypt: null");
+        return null;
+    }
 
     const buf = Buffer.from(payload, "base64");
     if (buf.length < 12 + 16) {
@@ -91,10 +94,31 @@ const hashForLookup = (value) => {
     return hmac.digest("hex");
 };
 
+/**
+ * Derive a fresh AES-256 key from user password input.
+ * Returns both key and a transport-safe code payload (salt + key).
+ */
+const generateEncryptionKeyFromPassword = (passwordInput) => {
+    const password = String(passwordInput || "");
+    if (!password.trim()) {
+        throw new Error("Password input is required");
+    }
+
+    const salt = crypto.randomBytes(PASSWORD_DERIVE_SALT_BYTES);
+    const derivedKey = crypto.scryptSync(password, salt, REQUIRED_AES_KEY_BYTES);
+
+    return {
+        keyBase64: derivedKey.toString("base64"),
+        saltBase64: salt.toString("base64"),
+        code: Buffer.concat([salt, derivedKey]).toString("base64"),
+    };
+};
+
 module.exports = {
     encrypt,
     decrypt,
     hashForLookup,
     normalize,
+    generateEncryptionKeyFromPassword,
 };
 
