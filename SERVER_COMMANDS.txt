@@ -112,3 +112,20 @@ COMMAND: Invoke-WebRequest -Uri "https://studentcheck-server.onrender.com/backup
 PURPOSE: Verifies that /backup/decrypt is deployed. Expected response when deployed: 400 (invalid payload). If 404, deployment is outdated.
 ENV (optional): BACKUP_API_KEY
 SHELL: PowerShell
+
+============================================================
+COMMAND: npm run backup:encrypt-users
+PURPOSE: Encrypts only `email` and `password` fields inside backup data while keeping full backup structure unchanged. Saves result to encrypted_data/user_fields/<timestamp>.js
+ENV: BACKUP_BASE_URL (optional), BACKUP_API_KEY (optional), BACKUP_INPUT (optional input file path)
+NOTE: Input auto-selection priority is decrypted_data/ latest file, then backups/ latest full backup.
+
+============================================================
+COMMAND: npm run backup:encrypt-users -- decrypted_data/<backup-file>.js
+PURPOSE: Encrypts only `email` and `password` fields from a specific backup file and saves output to encrypted_data/user_fields/<timestamp>.js
+ENV: BACKUP_BASE_URL (optional), BACKUP_API_KEY (optional)
+
+============================================================
+COMMAND: Invoke-WebRequest -Uri "https://studentcheck-server.onrender.com/backup/encrypt-user-fields" -Method Post -ContentType "application/json" -Body "{}"
+PURPOSE: Verifies that /backup/encrypt-user-fields is deployed. Expected response when deployed: 400 (invalid payload). If 404, deployment is outdated.
+ENV (optional): BACKUP_API_KEY
+SHELL: PowerShell
