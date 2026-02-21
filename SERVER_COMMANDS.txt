@@ -94,3 +94,21 @@ SHELL: PowerShell
 COMMAND: $env:BACKUP_ENCRYPTION_KEY="<base64-or-hex-32-byte-key>"
 PURPOSE: Optional override key used only for backup encryption/decryption workflows (typically set in Render env).
 SHELL: PowerShell
+
+============================================================
+COMMAND: npm run backup:decrypt
+PURPOSE: Decrypts the latest file from encrypted_data/ and saves decrypted backup output in decrypted_data/<timestamp>.js
+ENV: BACKUP_BASE_URL (optional), BACKUP_API_KEY (optional), ENCRYPTED_INPUT (optional encrypted file path)
+NOTE: Decryption key is read on the server side from Render environment variables (BACKUP_ENCRYPTION_KEY or ENCRYPTION_KEY).
+
+============================================================
+COMMAND: npm run backup:decrypt -- encrypted_data/<encrypted-file>.js
+PURPOSE: Decrypts a specific encrypted backup file and saves output in decrypted_data/<timestamp>.js
+ENV: BACKUP_BASE_URL (optional), BACKUP_API_KEY (optional)
+NOTE: Decryption key is read on the server side from Render environment variables (BACKUP_ENCRYPTION_KEY or ENCRYPTION_KEY).
+
+============================================================
+COMMAND: Invoke-WebRequest -Uri "https://studentcheck-server.onrender.com/backup/decrypt" -Method Post -ContentType "application/json" -Body "{}"
+PURPOSE: Verifies that /backup/decrypt is deployed. Expected response when deployed: 400 (invalid payload). If 404, deployment is outdated.
+ENV (optional): BACKUP_API_KEY
+SHELL: PowerShell
