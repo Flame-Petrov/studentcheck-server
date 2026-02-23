@@ -4,6 +4,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "test": "node tests/passwordAuth.test.js",
     "backup:db": "node scripts/createDatabaseBackup.js",
     "restore:db": "node scripts/restoreDatabaseBackup.js",
     "backup:encrypt": "node scripts/encryptBackupData.js",
@@ -13,6 +14,7 @@
     "db:load-table": "node scripts/loadTableFromFile.js"
   },
   "dependencies": {
+    "argon2": "^0.41.1",
     "express": "^4.18.2",
     "pg": "^8.11.0",
     "cors": "^2.8.5",

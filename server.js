@@ -11,6 +11,15 @@ const { createBackupHandlers } = require("./backupService");
 const { createBillingRouter, createBillingWebhookHandler } = require("./billingRoutes");
 const { encryptRaw, decrypt, hashForLookup, hashExactForLookup, normalize } = require("./security/cryptoService");
 const { inflateStudent } = require("./security/decryptors");
+const {
+    ARGON2_ALGORITHM,
+    buildArgon2PasswordFields,
+    verifyPasswordWithMigration,
+} = require("./security/passwordAuth");
+
+if (!String(process.env.AUTH_PEPPER || "").trim()) {
+    throw new Error("AUTH_PEPPER is required");
+}
 
 const app = express();
 
@@ -36,8 +45,11 @@ const formatBgTime = (date = new Date()) => {
 const scrubRequestBody = (body) => {
     if (!body || typeof body !== "object") return body;
     const cleaned = { ...body };
-    if (Object.prototype.hasOwnProperty.call(cleaned, "password")) {
-        cleaned.password = "[REDACTED]";
+    const sensitiveKeys = ["password", "password_hash", "passwordHash"];
+    for (const key of sensitiveKeys) {
+        if (Object.prototype.hasOwnProperty.call(cleaned, key)) {
+            cleaned[key] = "[REDACTED]";
+        }
     }
     return cleaned;
 };
@@ -177,18 +189,23 @@ const applyEncryptionMigration = async (client) => {
           ADD COLUMN IF NOT EXISTS email_hash TEXT,
           ADD COLUMN IF NOT EXISTS faculty_number_encrypted TEXT,
           ADD COLUMN IF NOT EXISTS faculty_number_hash TEXT,
-          ADD COLUMN IF NOT EXISTS password_hash TEXT;
+          ADD COLUMN IF NOT EXISTS password_hash TEXT,
+          ADD COLUMN IF NOT EXISTS hash_algorithm TEXT,
+          ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ;
 
         ALTER TABLE teachers
           ADD COLUMN IF NOT EXISTS email_encrypted TEXT,
           ADD COLUMN IF NOT EXISTS email_hash TEXT,
-          ADD COLUMN IF NOT EXISTS password_hash TEXT;
+          ADD COLUMN IF NOT EXISTS password_hash TEXT,
+          ADD COLUMN IF NOT EXISTS hash_algorithm TEXT,
+          ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ;
+
+        ALTER TABLE students ALTER COLUMN password DROP NOT NULL;
+        ALTER TABLE teachers ALTER COLUMN password DROP NOT NULL;
 
         CREATE INDEX IF NOT EXISTS idx_students_email_hash ON students (email_hash);
         CREATE INDEX IF NOT EXISTS idx_students_faculty_number_hash ON students (faculty_number_hash);
-        CREATE INDEX IF NOT EXISTS idx_students_password_hash ON students (password_hash);
         CREATE INDEX IF NOT EXISTS idx_teachers_email_hash ON teachers (email_hash);
-        CREATE INDEX IF NOT EXISTS idx_teachers_password_hash ON teachers (password_hash);
     `);
     console.log("[MIGRATION] Encryption/hash columns migration completed (or already in place).");
 };
@@ -211,7 +228,7 @@ const getPlainTextFromPossiblyEncrypted = (value) => {
 };
 
 const backfillEncryptionForExistingData = async (client) => {
-    console.log("[BACKFILL] Starting backfill for students/teachers encrypted + hash fields (email/password + faculty)...");
+    console.log("[BACKFILL] Starting backfill for students/teachers encrypted + hash fields (email + faculty)...");
 
     const { rows: studentRows } = await client.query(`
         SELECT
@@ -221,13 +238,10 @@ const backfillEncryptionForExistingData = async (client) => {
             email_hash,
             faculty_number,
             faculty_number_encrypted,
-            faculty_number_hash,
-            password,
-            password_hash
+            faculty_number_hash
         FROM students
         WHERE email IS NOT NULL
            OR faculty_number IS NOT NULL
-           OR password IS NOT NULL
     `);
 
     let studentsUpdated = 0;
@@ -255,15 +269,6 @@ const backfillEncryptionForExistingData = async (client) => {
             }
         }
 
-        if (row.password) {
-            const { plainText: passwordPlain, wasEncrypted: passwordWasEncrypted } =
-                getPlainTextFromPossiblyEncrypted(row.password);
-            if (passwordPlain && (!row.password_hash || !passwordWasEncrypted)) {
-                updates.password = encryptRaw(passwordPlain);
-                updates.password_hash = hashExactForLookup(passwordPlain);
-            }
-        }
-
         const fields = Object.keys(updates);
         if (fields.length === 0) continue;
 
@@ -284,12 +289,9 @@ const backfillEncryptionForExistingData = async (client) => {
             id,
             email,
             email_encrypted,
-            email_hash,
-            password,
-            password_hash
+            email_hash
         FROM teachers
         WHERE email IS NOT NULL
-           OR password IS NOT NULL
     `);
 
     let teachersUpdated = 0;
@@ -305,15 +307,6 @@ const backfillEncryptionForExistingData = async (client) => {
                 updates.email = emailEncrypted;
                 updates.email_encrypted = emailEncrypted;
                 updates.email_hash = hashForLookup(emailNorm);
-            }
-        }
-
-        if (row.password) {
-            const { plainText: passwordPlain, wasEncrypted: passwordWasEncrypted } =
-                getPlainTextFromPossiblyEncrypted(row.password);
-            if (passwordPlain && (!row.password_hash || !passwordWasEncrypted)) {
-                updates.password = encryptRaw(passwordPlain);
-                updates.password_hash = hashExactForLookup(passwordPlain);
             }
         }
 
@@ -454,23 +447,6 @@ const identifierMatches = ({ inputNormalized, rowHash, rowPlain, rowEncrypted })
     return false;
 };
 
-const passwordMatches = ({ inputPassword, rowPassword, rowPasswordHash }) => {
-    if (typeof inputPassword !== "string" || !inputPassword) return false;
-
-    if (rowPasswordHash && hashExactForLookup(inputPassword) === rowPasswordHash) {
-        return true;
-    }
-
-    if (typeof rowPassword !== "string" || !rowPassword) return false;
-
-    if (rowPassword === inputPassword) {
-        return true;
-    }
-
-    const decryptedPassword = tryDecryptValue(rowPassword);
-    return Boolean(decryptedPassword && decryptedPassword === inputPassword);
-};
-
 const getResolvedEmailForResponse = (row) => {
     const fromEncryptedColumn = tryDecryptValue(row.email_encrypted);
     if (fromEncryptedColumn) return fromEncryptedColumn;
@@ -508,8 +484,8 @@ app.post("/teacherLogin", async (req, res) => {
         const { email, password } = req.body;
 
         if (!email || !password) {
-            return res.status(400).send({
-                error: "Email and password are required"
+            return res.status(401).send({
+                error: "Invalid credentials"
             });
         }
 
@@ -517,54 +493,65 @@ app.post("/teacherLogin", async (req, res) => {
 
         const emailNorm = normalize(email);
         const emailHash = hashForLookup(emailNorm);
-        const passwordHash = hashExactForLookup(password);
 
         const fastResult = await pool.query(
             `
-            SELECT id, full_name, email, email_encrypted, email_hash, password, password_hash
+            SELECT id, full_name, email, email_encrypted, email_hash, password, password_hash, hash_algorithm, password_updated_at
             FROM teachers
             WHERE email_hash = $1
-              AND password_hash = $2
             LIMIT 1
             `,
-            [emailHash, passwordHash]
+            [emailHash]
         );
 
-        let teacher = fastResult.rows[0] || null;
-
-        if (!teacher) {
+        let candidateRows = fastResult.rows;
+        if (!candidateRows.length) {
             const fallbackCandidates = await pool.query(
                 `
-                SELECT id, full_name, email, email_encrypted, email_hash, password, password_hash
+                SELECT id, full_name, email, email_encrypted, email_hash, password, password_hash, hash_algorithm, password_updated_at
                 FROM teachers
                 ORDER BY id ASC
                 LIMIT 5000
                 `
             );
 
-            teacher = fallbackCandidates.rows.find((row) => {
+            candidateRows = fallbackCandidates.rows.filter((row) => {
                 return identifierMatches({
                     inputNormalized: emailNorm,
                     rowHash: row.email_hash,
                     rowPlain: row.email,
                     rowEncrypted: row.email_encrypted,
-                }) && passwordMatches({
-                    inputPassword: password,
-                    rowPassword: row.password,
-                    rowPasswordHash: row.password_hash,
                 });
-            }) || null;
+            });
         }
 
-        if (!teacher) {
+        let teacher = null;
+        let passwordCheck = { isValid: false, needsMigration: false, matchedWith: null };
+        for (const candidate of candidateRows) {
+            const candidateCheck = await verifyPasswordWithMigration({
+                inputPassword: password,
+                rowPassword: candidate.password,
+                rowPasswordHash: candidate.password_hash,
+                rowHashAlgorithm: candidate.hash_algorithm,
+                legacyHashVerifier: hashExactForLookup,
+                legacyDecryptor: tryDecryptValue,
+            });
+
+            if (candidateCheck.isValid) {
+                teacher = candidate;
+                passwordCheck = candidateCheck;
+                break;
+            }
+        }
+
+        if (!teacher || !passwordCheck.isValid) {
             return res.status(401).send({
-                error: "Invalid email or password"
+                error: "Invalid credentials"
             });
         }
 
         const updates = {};
         const emailFromMainColumn = tryDecryptValue(teacher.email);
-        const passwordFromMainColumn = tryDecryptValue(teacher.password);
 
         if (!teacher.email_hash) {
             updates.email_hash = emailHash;
@@ -575,11 +562,19 @@ app.post("/teacherLogin", async (req, res) => {
         if (!emailFromMainColumn) {
             updates.email = updates.email_encrypted || encryptRaw(emailNorm);
         }
-        if (!teacher.password_hash) {
-            updates.password_hash = passwordHash;
-        }
-        if (!passwordFromMainColumn && teacher.password === password) {
-            updates.password = encryptRaw(password);
+
+        if (passwordCheck.needsMigration) {
+            Object.assign(updates, await buildArgon2PasswordFields(password));
+        } else {
+            if (!teacher.hash_algorithm) {
+                updates.hash_algorithm = ARGON2_ALGORITHM;
+            }
+            if (!teacher.password_updated_at) {
+                updates.password_updated_at = new Date();
+            }
+            if (teacher.password !== null) {
+                updates.password = null;
+            }
         }
 
         await updateAuthFieldsById("teachers", teacher.id, updates);
@@ -614,8 +609,8 @@ app.post("/studentLogin", async (req, res) => {
         const { facultyNumber, password } = req.body;
 
         if (!facultyNumber || !password) {
-            return res.status(400).send({
-                error: "Faculty number and password are required"
+            return res.status(401).send({
+                error: "Invalid credentials"
             });
         }
 
@@ -623,7 +618,6 @@ app.post("/studentLogin", async (req, res) => {
 
         const facultyNorm = normalize(facultyNumber);
         const facultyHash = hashForLookup(facultyNorm);
-        const passwordHash = hashExactForLookup(password);
 
         const fastResult = await pool.query(
             `
@@ -638,6 +632,8 @@ app.post("/studentLogin", async (req, res) => {
                 faculty_number_hash,
                 password,
                 password_hash,
+                hash_algorithm,
+                password_updated_at,
                 "group",
                 course,
                 faculty,
@@ -645,15 +641,13 @@ app.post("/studentLogin", async (req, res) => {
                 specialization
             FROM students
             WHERE faculty_number_hash = $1
-              AND password_hash = $2
             LIMIT 1
             `,
-            [facultyHash, passwordHash]
+            [facultyHash]
         );
 
-        let studentRow = fastResult.rows[0] || null;
-
-        if (!studentRow) {
+        let candidateRows = fastResult.rows;
+        if (!candidateRows.length) {
             const fallbackCandidates = await pool.query(
                 `
                 SELECT
@@ -667,6 +661,8 @@ app.post("/studentLogin", async (req, res) => {
                     faculty_number_hash,
                     password,
                     password_hash,
+                    hash_algorithm,
+                    password_updated_at,
                     "group",
                     course,
                     faculty,
@@ -678,36 +674,57 @@ app.post("/studentLogin", async (req, res) => {
                 `
             );
 
-            studentRow = fallbackCandidates.rows.find((row) => {
+            candidateRows = fallbackCandidates.rows.filter((row) => {
                 return identifierMatches({
                     inputNormalized: facultyNorm,
                     rowHash: row.faculty_number_hash,
                     rowPlain: row.faculty_number,
                     rowEncrypted: row.faculty_number_encrypted,
-                }) && passwordMatches({
-                    inputPassword: password,
-                    rowPassword: row.password,
-                    rowPasswordHash: row.password_hash,
                 });
-            }) || null;
+            });
         }
 
-        if (!studentRow) {
+        let studentRow = null;
+        let passwordCheck = { isValid: false, needsMigration: false, matchedWith: null };
+        for (const candidate of candidateRows) {
+            const candidateCheck = await verifyPasswordWithMigration({
+                inputPassword: password,
+                rowPassword: candidate.password,
+                rowPasswordHash: candidate.password_hash,
+                rowHashAlgorithm: candidate.hash_algorithm,
+                legacyHashVerifier: hashExactForLookup,
+                legacyDecryptor: tryDecryptValue,
+            });
+
+            if (candidateCheck.isValid) {
+                studentRow = candidate;
+                passwordCheck = candidateCheck;
+                break;
+            }
+        }
+
+        if (!studentRow || !passwordCheck.isValid) {
             return res.status(401).send({
-                error: "Invalid faculty number or password"
+                error: "Invalid credentials"
             });
         }
 
         const updates = {};
-        const passwordFromMainColumn = tryDecryptValue(studentRow.password);
         const emailFromMainColumn = tryDecryptValue(studentRow.email);
         const facultyFromMainColumn = tryDecryptValue(studentRow.faculty_number);
 
-        if (!studentRow.password_hash) {
-            updates.password_hash = passwordHash;
-        }
-        if (!passwordFromMainColumn && studentRow.password === password) {
-            updates.password = encryptRaw(password);
+        if (passwordCheck.needsMigration) {
+            Object.assign(updates, await buildArgon2PasswordFields(password));
+        } else {
+            if (!studentRow.hash_algorithm) {
+                updates.hash_algorithm = ARGON2_ALGORITHM;
+            }
+            if (!studentRow.password_updated_at) {
+                updates.password_updated_at = new Date();
+            }
+            if (studentRow.password !== null) {
+                updates.password = null;
+            }
         }
 
         if (!studentRow.faculty_number_hash) {
@@ -795,8 +812,7 @@ app.post("/registration", async (req, res) => {
         const facultyEncrypted = encryptRaw(normalizedFacultyNumber);
         const facultyHash = hashForLookup(normalizedFacultyNumber);
 
-        const passwordEncrypted = encryptRaw(user.password);
-        const passwordHash = hashExactForLookup(user.password);
+        const passwordFields = await buildArgon2PasswordFields(user.password);
 
         const duplicateCheck = await pool.query(
             `
@@ -823,6 +839,8 @@ app.post("/registration", async (req, res) => {
                 faculty_number,
                 password,
                 password_hash,
+                hash_algorithm,
+                password_updated_at,
                 level,
                 faculty,
                 specialization,
@@ -834,7 +852,7 @@ app.post("/registration", async (req, res) => {
                 faculty_number_encrypted,
                 faculty_number_hash
             ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
             )
             RETURNING full_name, email, faculty_number, "group", course, faculty, level, specialization
             `,
@@ -842,8 +860,10 @@ app.post("/registration", async (req, res) => {
                 fullName,
                 emailEncrypted,
                 user.facultyNumber,
-                passwordEncrypted,
-                passwordHash,
+                passwordFields.password,
+                passwordFields.password_hash,
+                passwordFields.hash_algorithm,
+                passwordFields.password_updated_at,
                 user.level,
                 user.faculty,
                 user.specialization,
