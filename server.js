@@ -198,6 +198,7 @@ app.post("/api/billing/webhook", express.raw({ type: "application/json" }), crea
 
 // Lightweight uptime probe endpoint for frontend keep-alive pings.
 app.get("/healthz", (req, res) => {
+    console.log(`[HEALTHZ] ping from ${req.ip} at ${new Date().toISOString()}`);
     res.set("Cache-Control", "no-store");
     return res.status(200).send({
         ok: true,
