@@ -365,15 +365,15 @@ const requireTeacherAuth = async (req, res, next) => {
         return res.status(401).send({ error: "Invalid or expired token" });
     }
     if (payload.emailHash && teacherResult.rows[0].email_hash && payload.emailHash !== teacherResult.rows[0].email_hash) {
+        // Soft warning only: teacher identity is already validated by signed token + DB teacher id existence.
         logAuthEvent({
             requestId,
             endpoint: req.originalUrl,
             authHeaderPresent: true,
-            tokenVerificationStatus: "email_hash_mismatch",
-            statusCode: 401,
+            tokenVerificationStatus: "email_hash_mismatch_soft",
+            statusCode: 200,
             teacherId,
         });
-        return res.status(401).send({ error: "Invalid or expired token" });
     }
 
     req.authTeacherId = teacherId;
