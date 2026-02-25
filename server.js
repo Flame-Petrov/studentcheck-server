@@ -196,6 +196,16 @@ const stripeService = createStripeService({
 // Stripe webhook must use raw body for signature verification
 app.post("/api/billing/webhook", express.raw({ type: "application/json" }), createBillingWebhookHandler(stripeService));
 
+// Lightweight uptime probe endpoint for frontend keep-alive pings.
+app.get("/healthz", (req, res) => {
+    res.set("Cache-Control", "no-store");
+    return res.status(200).send({
+        ok: true,
+        service: "studentcheck-server",
+        timestamp: new Date().toISOString(),
+    });
+});
+
 app.use((req, res, next) => {
     const isJsonWrite = ["POST", "PUT", "PATCH"].includes(req.method);
     const isStripeWebhook = req.path === "/api/billing/webhook";
