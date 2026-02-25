@@ -16,6 +16,17 @@ const {
     buildArgon2PasswordFields,
     verifyPasswordWithMigration,
 } = require("./security/passwordAuth");
+const {
+    normalizeEmailInput,
+    normalizeFacultyNumberInput,
+    isValidEmail,
+    isValidFacultyNumber,
+    parseAndValidateGroup,
+} = require("./security/inputValidation");
+const {
+    buildCheckEmailHandler,
+    buildCheckFacultyNumberHandler,
+} = require("./security/studentEndpointHandlers");
 
 if (!String(process.env.AUTH_PEPPER || "").trim()) {
     throw new Error("AUTH_PEPPER is required");
@@ -45,7 +56,17 @@ const formatBgTime = (date = new Date()) => {
 const scrubRequestBody = (body) => {
     if (!body || typeof body !== "object") return body;
     const cleaned = { ...body };
-    const sensitiveKeys = ["password", "password_hash", "passwordHash"];
+    const sensitiveKeys = [
+        "password",
+        "password_hash",
+        "passwordHash",
+        "token",
+        "accessToken",
+        "refreshToken",
+        "email",
+        "facultyNumber",
+        "faculty_number",
+    ];
     for (const key of sensitiveKeys) {
         if (Object.prototype.hasOwnProperty.call(cleaned, key)) {
             cleaned[key] = "[REDACTED]";
@@ -170,8 +191,43 @@ const stripeService = createStripeService({
 // Stripe webhook must use raw body for signature verification
 app.post("/api/billing/webhook", express.raw({ type: "application/json" }), createBillingWebhookHandler(stripeService));
 
-app.use(express.json({ limit: "50mb" }));
+app.use((req, res, next) => {
+    const isJsonWrite = ["POST", "PUT", "PATCH"].includes(req.method);
+    const isStripeWebhook = req.path === "/api/billing/webhook";
+    if (!isJsonWrite || isStripeWebhook) return next();
+    if (!req.is("application/json")) {
+        return res.status(415).send({ error: "Content-Type must be application/json" });
+    }
+    next();
+});
+
+app.use(express.json({ limit: "32kb" }));
 app.use("/api/billing", createBillingRouter(stripeService));
+
+const createRouteRateLimiter = ({ windowMs, maxRequests }) => {
+    const hits = new Map();
+    return (req, res, next) => {
+        const now = Date.now();
+        const key = `${req.ip}:${req.path}`;
+        const entry = hits.get(key);
+
+        if (!entry || now - entry.windowStart >= windowMs) {
+            hits.set(key, { count: 1, windowStart: now });
+            return next();
+        }
+
+        entry.count += 1;
+        if (entry.count > maxRequests) {
+            return res.status(429).send({ error: "Too many requests" });
+        }
+        return next();
+    };
+};
+
+const registrationRateLimit = createRouteRateLimiter({ windowMs: 10 * 60 * 1000, maxRequests: 20 });
+const checkRouteRateLimit = createRouteRateLimiter({ windowMs: 10 * 60 * 1000, maxRequests: 60 });
+const checkEmailHandler = buildCheckEmailHandler({ pool, normalize, hashForLookup, minimumDurationMs: 120 });
+const checkFacultyNumberHandler = buildCheckFacultyNumberHandler({ pool, normalize, hashForLookup, minimumDurationMs: 120 });
 
 // Flag-controlled migration/backfill for encrypted/hash fields on sensitive columns
 const APPLY_ENCRYPTION_MIGRATION =
@@ -206,6 +262,13 @@ const applyEncryptionMigration = async (client) => {
         CREATE INDEX IF NOT EXISTS idx_students_email_hash ON students (email_hash);
         CREATE INDEX IF NOT EXISTS idx_students_faculty_number_hash ON students (faculty_number_hash);
         CREATE INDEX IF NOT EXISTS idx_teachers_email_hash ON teachers (email_hash);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_students_email_hash ON students (email_hash) WHERE email_hash IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_students_faculty_number_hash ON students (faculty_number_hash) WHERE faculty_number_hash IS NOT NULL;
+
+        ALTER TABLE students DROP CONSTRAINT IF EXISTS students_group_check;
+        ALTER TABLE students
+            ADD CONSTRAINT students_group_check
+            CHECK ("group" ~ '^[0-9]+$' AND "group"::integer BETWEEN 30 AND 50);
     `);
     console.log("[MIGRATION] Encryption/hash columns migration completed (or already in place).");
 };
@@ -778,7 +841,17 @@ app.post("/studentLogin", async (req, res) => {
 
 
 
-app.post("/registration", async (req, res) => {
+app.post("/students/check-email", checkRouteRateLimit, async (req, res) => {
+    logRequestStart(req, { includeBody: false });
+    return checkEmailHandler(req, res);
+});
+
+app.post("/students/check-faculty-number", checkRouteRateLimit, async (req, res) => {
+    logRequestStart(req, { includeBody: false });
+    return checkFacultyNumberHandler(req, res);
+});
+
+app.post("/registration", registrationRateLimit, async (req, res) => {
     logRequestStart(req);
 
     try {
@@ -788,13 +861,13 @@ app.post("/registration", async (req, res) => {
         const courseValue = user.course;
         const groupValue = user.group;
         const validCourses = ["1", "2", "3", "4"];
-        const validGroups = ["37", "38", "39", "40", "41", "42"];
+        const groupValidation = parseAndValidateGroup(groupValue);
 
         if (courseValue === undefined || courseValue === null || !validCourses.includes(String(courseValue))) {
             return res.status(400).send({ message: "Invalid course. Must be 1–4." });
         }
-        if (groupValue === undefined || groupValue === null || !validGroups.includes(String(groupValue))) {
-            return res.status(400).send({ message: "Invalid group. Must be 37–42." });
+        if (!groupValidation.isValid) {
+            return res.status(400).send({ message: "Invalid group. Must be 30-50." });
         }
 
         if (!user.email || !user.facultyNumber || !user.password) {
@@ -803,8 +876,11 @@ app.post("/registration", async (req, res) => {
             });
         }
 
-        const normalizedEmail = normalize(user.email);
-        const normalizedFacultyNumber = normalize(user.facultyNumber);
+        const normalizedEmail = normalizeEmailInput(user.email, normalize);
+        const normalizedFacultyNumber = normalizeFacultyNumberInput(user.facultyNumber, normalize);
+        if (!isValidEmail(normalizedEmail) || !isValidFacultyNumber(normalizedFacultyNumber)) {
+            return res.status(400).send({ message: "Invalid registration data." });
+        }
 
         const emailEncrypted = encryptRaw(normalizedEmail);
         const emailHash = hashForLookup(normalizedEmail);
@@ -825,7 +901,7 @@ app.post("/registration", async (req, res) => {
         );
         if (duplicateCheck.rows.length > 0) {
             return res.status(409).send({
-                error: "An account with these details already exists (email or faculty number)",
+                error: "Unable to register with provided details.",
                 registrationSuccess: false
             });
         }
@@ -859,7 +935,7 @@ app.post("/registration", async (req, res) => {
             [
                 fullName,
                 emailEncrypted,
-                user.facultyNumber,
+                facultyEncrypted,
                 passwordFields.password,
                 passwordFields.password_hash,
                 passwordFields.hash_algorithm,
@@ -867,7 +943,7 @@ app.post("/registration", async (req, res) => {
                 user.level,
                 user.faculty,
                 user.specialization,
-                String(groupValue),
+                String(groupValidation.parsed),
                 String(courseValue),
                 new Date(),
                 emailEncrypted,
@@ -880,7 +956,7 @@ app.post("/registration", async (req, res) => {
         const student = {
             ...result.rows[0],
             email: normalizedEmail,
-            faculty_number: user.facultyNumber,
+            faculty_number: normalizedFacultyNumber,
         };
         return res.send({ message: "User registration successful", student, registrationSuccess: true });
     } catch (error) {
@@ -888,7 +964,7 @@ app.post("/registration", async (req, res) => {
         if (error && error.code === '23505') {
             console.warn('⚠️ Duplicate registration attempt:', error.detail || error.constraint);
             return res.status(409).send({ 
-                error: "An account with these details already exists (email or faculty number)",
+                error: "Unable to register with provided details.",
                 registrationSuccess: false
             });
         }
