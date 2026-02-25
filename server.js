@@ -32,6 +32,11 @@ const {
     mapRegistrationUniqueViolation,
     insertStudentWithIdCollisionRecovery,
 } = require("./security/registrationDb");
+const {
+    signAuthToken,
+    verifyAuthToken,
+    parseAuthorizationHeader,
+} = require("./security/teacherAuth");
 
 if (!String(process.env.AUTH_PEPPER || "").trim()) {
     throw new Error("AUTH_PEPPER is required");
@@ -116,7 +121,8 @@ const addStudentsToClass = async (classId, students) => {
             }
             return s?.facultyNumber || s?.faculty_number;
         })
-        .filter(Boolean);
+        .filter(Boolean)
+        .map((value) => normalize(String(value)));
 
     console.log("[CLASS STUDENTS] facultyNumbers:", facultyNumbers);
 
@@ -125,31 +131,39 @@ const addStudentsToClass = async (classId, students) => {
         return { assignedCount: 0, facultyNumbers: [] };
     }
 
-    const placeholders = facultyNumbers.map((_, i) => `$${i + 1}`).join(",");
+    const normalizedToHash = new Map();
+    for (const fac of facultyNumbers) {
+        normalizedToHash.set(fac, hashForLookup(fac));
+    }
+
+    const hashes = Array.from(new Set(Array.from(normalizedToHash.values())));
+    const placeholders = hashes.map((_, i) => `$${i + 1}`).join(",");
     console.log("[CLASS STUDENTS] placeholders:", placeholders);
 
-    const selectSql = `SELECT id, faculty_number FROM students WHERE faculty_number IN (${placeholders})`;
+    const selectSql = `SELECT id, faculty_number_hash FROM students WHERE faculty_number_hash IN (${placeholders})`;
     console.log("[CLASS STUDENTS] selectSql:", selectSql);
 
-    const result = await pool.query(selectSql, facultyNumbers);
+    const result = await pool.query(selectSql, hashes);
     console.log("[CLASS STUDENTS] students matched:", result.rows);
 
     const idMap = {};
     result.rows.forEach(row => {
-        idMap[row.id] = row.faculty_number;
+        idMap[row.id] = row.faculty_number_hash;
     });
 
     const insertSql = "INSERT INTO class_students (class_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
     const studentIds = Object.keys(idMap);
     console.log("[CLASS STUDENTS] studentIds:", studentIds);
 
+    let addedCount = 0;
     for (const id of studentIds) {
         console.log("[CLASS STUDENTS] Assigning student_id:", id, "faculty_number:", idMap[id]);
-        await pool.query(insertSql, [classId, id]);
+        const insertRes = await pool.query(insertSql, [classId, id]);
+        addedCount += insertRes.rowCount || 0;
     }
 
     console.log("[CLASS STUDENTS] Assignment complete");
-    return { assignedCount: studentIds.length, facultyNumbers };
+    return { assignedCount: addedCount, facultyNumbers };
 };
 
 // Central CORS configuration (explicit preflight + allowed headers)
@@ -250,79 +264,114 @@ const checkEmailHandler = buildCheckEmailHandler({ pool, normalize, hashForLooku
 const checkFacultyNumberHandler = buildCheckFacultyNumberHandler({ pool, normalize, hashForLookup, minimumDurationMs: 120 });
 const loginAttemptState = new Map();
 
-const toBase64Url = (input) => Buffer.from(input).toString("base64url");
-const fromBase64UrlJson = (value) => JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
-
-const signAuthToken = (payload) => {
-    const header = { alg: "HS256", typ: "JWT" };
-    const encodedHeader = toBase64Url(JSON.stringify(header));
-    const encodedPayload = toBase64Url(JSON.stringify(payload));
-    const data = `${encodedHeader}.${encodedPayload}`;
-    const signature = crypto
-        .createHmac("sha256", AUTH_TOKEN_SECRET)
-        .update(data)
-        .digest("base64url");
-    return `${data}.${signature}`;
-};
-
-const verifyAuthToken = (token) => {
-    const parts = String(token || "").split(".");
-    if (parts.length !== 3) return null;
-    const [encodedHeader, encodedPayload, signature] = parts;
-    const data = `${encodedHeader}.${encodedPayload}`;
-    const expectedSignature = crypto
-        .createHmac("sha256", AUTH_TOKEN_SECRET)
-        .update(data)
-        .digest("base64url");
-    if (signature !== expectedSignature) return null;
-
-    const header = fromBase64UrlJson(encodedHeader);
-    if (header.alg !== "HS256" || header.typ !== "JWT") return null;
-
-    const payload = fromBase64UrlJson(encodedPayload);
-    if (!payload || typeof payload !== "object") return null;
-    if (payload.exp && Math.floor(Date.now() / 1000) > Number(payload.exp)) return null;
-    return payload;
-};
-
-const issueTeacherToken = ({ teacherId, emailHash }) => {
+const issueTeacherToken = ({ teacherId, emailHash, email }) => {
     const now = Math.floor(Date.now() / 1000);
-    return signAuthToken({
-        sub: String(teacherId),
-        role: "teacher",
-        emailHash,
-        iat: now,
-        exp: now + (12 * 60 * 60),
-    });
+    const expiresInSeconds = 12 * 60 * 60;
+    return {
+        token: signAuthToken({
+            secret: AUTH_TOKEN_SECRET,
+            payload: {
+                sub: String(teacherId),
+                teacherId: Number(teacherId),
+                role: "teacher",
+                email,
+                emailHash,
+                iat: now,
+                exp: now + expiresInSeconds,
+            },
+        }),
+        expiresIn: expiresInSeconds,
+    };
+};
+
+const logAuthEvent = (details) => {
+    console.log("[AUTH_EVENT]", details);
 };
 
 const requireTeacherAuth = async (req, res, next) => {
-    const authHeader = String(req.headers.authorization || "");
-    if (!authHeader.startsWith("Bearer ")) {
-        return res.status(401).send({ error: "Missing bearer token" });
+    const requestId = crypto.randomUUID();
+    const parsed = parseAuthorizationHeader(req.headers.authorization);
+
+    if (!parsed.ok) {
+        logAuthEvent({
+            requestId,
+            endpoint: req.originalUrl,
+            authHeaderPresent: Boolean(req.headers.authorization),
+            tokenVerificationStatus: "rejected_header",
+            statusCode: 401,
+            reason: parsed.error,
+        });
+        return res.status(401).send({ error: parsed.error });
     }
 
-    const token = authHeader.slice("Bearer ".length).trim();
-    const payload = verifyAuthToken(token);
+    const payload = verifyAuthToken({
+        token: parsed.token,
+        secret: AUTH_TOKEN_SECRET,
+    });
     if (!payload || payload.role !== "teacher" || !payload.sub) {
-        return res.status(401).send({ error: "Invalid token" });
+        logAuthEvent({
+            requestId,
+            endpoint: req.originalUrl,
+            authHeaderPresent: true,
+            tokenVerificationStatus: "invalid_or_expired",
+            statusCode: 401,
+        });
+        return res.status(401).send({ error: "Invalid or expired token" });
     }
 
     const teacherId = Number.parseInt(String(payload.sub), 10);
     if (!Number.isInteger(teacherId) || teacherId <= 0) {
-        return res.status(401).send({ error: "Invalid token" });
+        logAuthEvent({
+            requestId,
+            endpoint: req.originalUrl,
+            authHeaderPresent: true,
+            tokenVerificationStatus: "invalid_subject",
+            statusCode: 401,
+        });
+        return res.status(401).send({ error: "Invalid or expired token" });
     }
 
     const teacherResult = await pool.query("SELECT id, email_hash FROM teachers WHERE id = $1", [teacherId]);
     if (!teacherResult.rows.length) {
-        return res.status(401).send({ error: "Invalid token" });
+        logAuthEvent({
+            requestId,
+            endpoint: req.originalUrl,
+            authHeaderPresent: true,
+            tokenVerificationStatus: "teacher_not_found",
+            statusCode: 401,
+            teacherId,
+        });
+        return res.status(401).send({ error: "Invalid or expired token" });
     }
     if (payload.emailHash && teacherResult.rows[0].email_hash && payload.emailHash !== teacherResult.rows[0].email_hash) {
-        return res.status(401).send({ error: "Invalid token" });
+        logAuthEvent({
+            requestId,
+            endpoint: req.originalUrl,
+            authHeaderPresent: true,
+            tokenVerificationStatus: "email_hash_mismatch",
+            statusCode: 401,
+            teacherId,
+        });
+        return res.status(401).send({ error: "Invalid or expired token" });
     }
 
     req.authTeacherId = teacherId;
+    req.authRequestId = requestId;
+    req.user = {
+        teacherId,
+        role: "teacher",
+        email: payload.email || null,
+    };
     req.authTeacherEmailHash = teacherResult.rows[0].email_hash;
+    logAuthEvent({
+        requestId,
+        endpoint: req.originalUrl,
+        authHeaderPresent: true,
+        tokenVerificationStatus: "ok",
+        statusCode: 200,
+        teacherId,
+        teacherEmail: req.user.email,
+    });
     next();
 };
 
@@ -769,17 +818,25 @@ app.post("/teacherLogin", async (req, res) => {
         }
 
         await updateAuthFieldsById("teachers", teacher.id, updates);
+        const resolvedEmail = getResolvedEmailForResponse({
+            ...teacher,
+            ...updates,
+        });
+        const tokenPayload = issueTeacherToken({
+            teacherId: teacher.id,
+            emailHash: emailHash,
+            email: normalize(resolvedEmail || emailNorm),
+        });
 
         return res.send({
             message: "Teacher login successful",
             teacher: {
-                email: getResolvedEmailForResponse({
-                    ...teacher,
-                    ...updates,
-                }),
+                email: resolvedEmail,
                 fullName: teacher.full_name
             },
-            accessToken: issueTeacherToken({ teacherId: teacher.id, emailHash: emailHash }),
+            token: tokenPayload.token,
+            accessToken: tokenPayload.token,
+            expiresIn: tokenPayload.expiresIn,
             loginSuccess: true
         });
     } catch (error) {
@@ -1375,7 +1432,14 @@ app.post("/class_students", requireTeacherAuth, async (req, res) => {
     var classId = req.body.classId;
     var students = req.body.students; // array of student
 
-    console.log("classId:", classId);
+    console.log("[CLASS_STUDENTS_MUTATION]", {
+        requestId: req.authRequestId || null,
+        endpoint: "/class_students",
+        authHeaderPresent: Boolean(req.headers.authorization),
+        teacherId: req.authTeacherId || null,
+        teacherEmail: req.user?.email || null,
+        classId,
+    });
 
     try {
         if (!classId) {
@@ -1390,16 +1454,43 @@ app.post("/class_students", requireTeacherAuth, async (req, res) => {
             return res.status(404).send({ error: "Class not found" });
         }
         if (ownership.rows[0].teacher_id !== req.authTeacherId) {
-            return res.status(403).send({ error: "You do not have permission to modify this class" });
+            console.log("[CLASS_STUDENTS_MUTATION]", {
+                requestId: req.authRequestId || null,
+                endpoint: "/class_students",
+                ownership: "mismatch",
+                classId,
+                authTeacherId: req.authTeacherId,
+                classOwnerTeacherId: ownership.rows[0].teacher_id,
+                statusCode: 403,
+            });
+            return res.status(403).send({ error: "Forbidden: class does not belong to authenticated teacher" });
         }
 
         const assignmentResult = await addStudentsToClass(classId, students);
         console.log("[CLASS STUDENTS] Assignment result:", assignmentResult);
+        console.log("[CLASS_STUDENTS_MUTATION]", {
+            requestId: req.authRequestId || null,
+            endpoint: "/class_students",
+            ownership: "ok",
+            classId: Number(classId),
+            addedCount: Number(assignmentResult.assignedCount || 0),
+            statusCode: 200,
+        });
 
-        res.send({ message: "Students added to class successfully" });
+        return res.status(200).send({
+            success: true,
+            classId: Number(classId),
+            addedCount: Number(assignmentResult.assignedCount || 0),
+        });
     } catch (error) {
-        console.error("Error adding students to class:", error);
-        res.status(500).send({ message: "Error on adding students to class (database error)" });
+        console.error("[CLASS_STUDENTS_MUTATION][DB_ERROR]", {
+            requestId: req.authRequestId || null,
+            endpoint: "/class_students",
+            classId,
+            statusCode: 500,
+            code: error?.code,
+        });
+        return res.status(500).send({ error: "Internal server error" });
     }
     
 
