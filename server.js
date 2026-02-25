@@ -3,6 +3,7 @@ const DATABASE_URL = "postgresql://postgres:Flame-Supabase01!@db.imnqwnpsuapkbbn
 
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const { Pool } = require("pg"); // PostgreSQL client
 const Stripe = require("stripe");
 const { createDbAdapter } = require("./dbAdapter");
@@ -30,6 +31,10 @@ const {
 
 if (!String(process.env.AUTH_PEPPER || "").trim()) {
     throw new Error("AUTH_PEPPER is required");
+}
+const AUTH_TOKEN_SECRET = String(process.env.AUTH_TOKEN_SECRET || process.env.AUTH_PEPPER || "").trim();
+if (!AUTH_TOKEN_SECRET) {
+    throw new Error("AUTH_TOKEN_SECRET is required");
 }
 
 const app = express();
@@ -228,6 +233,108 @@ const registrationRateLimit = createRouteRateLimiter({ windowMs: 10 * 60 * 1000,
 const checkRouteRateLimit = createRouteRateLimiter({ windowMs: 10 * 60 * 1000, maxRequests: 60 });
 const checkEmailHandler = buildCheckEmailHandler({ pool, normalize, hashForLookup, minimumDurationMs: 120 });
 const checkFacultyNumberHandler = buildCheckFacultyNumberHandler({ pool, normalize, hashForLookup, minimumDurationMs: 120 });
+const loginAttemptState = new Map();
+
+const toBase64Url = (input) => Buffer.from(input).toString("base64url");
+const fromBase64UrlJson = (value) => JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+
+const signAuthToken = (payload) => {
+    const header = { alg: "HS256", typ: "JWT" };
+    const encodedHeader = toBase64Url(JSON.stringify(header));
+    const encodedPayload = toBase64Url(JSON.stringify(payload));
+    const data = `${encodedHeader}.${encodedPayload}`;
+    const signature = crypto
+        .createHmac("sha256", AUTH_TOKEN_SECRET)
+        .update(data)
+        .digest("base64url");
+    return `${data}.${signature}`;
+};
+
+const verifyAuthToken = (token) => {
+    const parts = String(token || "").split(".");
+    if (parts.length !== 3) return null;
+    const [encodedHeader, encodedPayload, signature] = parts;
+    const data = `${encodedHeader}.${encodedPayload}`;
+    const expectedSignature = crypto
+        .createHmac("sha256", AUTH_TOKEN_SECRET)
+        .update(data)
+        .digest("base64url");
+    if (signature !== expectedSignature) return null;
+
+    const header = fromBase64UrlJson(encodedHeader);
+    if (header.alg !== "HS256" || header.typ !== "JWT") return null;
+
+    const payload = fromBase64UrlJson(encodedPayload);
+    if (!payload || typeof payload !== "object") return null;
+    if (payload.exp && Math.floor(Date.now() / 1000) > Number(payload.exp)) return null;
+    return payload;
+};
+
+const issueTeacherToken = ({ teacherId, emailHash }) => {
+    const now = Math.floor(Date.now() / 1000);
+    return signAuthToken({
+        sub: String(teacherId),
+        role: "teacher",
+        emailHash,
+        iat: now,
+        exp: now + (12 * 60 * 60),
+    });
+};
+
+const requireTeacherAuth = async (req, res, next) => {
+    const authHeader = String(req.headers.authorization || "");
+    if (!authHeader.startsWith("Bearer ")) {
+        return res.status(401).send({ error: "Missing bearer token" });
+    }
+
+    const token = authHeader.slice("Bearer ".length).trim();
+    const payload = verifyAuthToken(token);
+    if (!payload || payload.role !== "teacher" || !payload.sub) {
+        return res.status(401).send({ error: "Invalid token" });
+    }
+
+    const teacherId = Number.parseInt(String(payload.sub), 10);
+    if (!Number.isInteger(teacherId) || teacherId <= 0) {
+        return res.status(401).send({ error: "Invalid token" });
+    }
+
+    const teacherResult = await pool.query("SELECT id, email_hash FROM teachers WHERE id = $1", [teacherId]);
+    if (!teacherResult.rows.length) {
+        return res.status(401).send({ error: "Invalid token" });
+    }
+    if (payload.emailHash && teacherResult.rows[0].email_hash && payload.emailHash !== teacherResult.rows[0].email_hash) {
+        return res.status(401).send({ error: "Invalid token" });
+    }
+
+    req.authTeacherId = teacherId;
+    req.authTeacherEmailHash = teacherResult.rows[0].email_hash;
+    next();
+};
+
+const getLoginAttemptKey = (req, identifier) => `${req.ip}|${req.path}|${String(identifier || "").slice(0, 256)}`;
+const getRetryDelayMs = (fails) => Math.min(15000, fails * 750);
+
+const enforceLoginThrottle = (req, res, key) => {
+    const entry = loginAttemptState.get(key);
+    const now = Date.now();
+    if (entry && entry.lockedUntil && now < entry.lockedUntil) {
+        return res.status(429).send({ error: "Too many attempts. Try again later." });
+    }
+    return null;
+};
+
+const recordLoginFailure = (key) => {
+    const now = Date.now();
+    const entry = loginAttemptState.get(key) || { fails: 0, lockedUntil: 0 };
+    entry.fails += 1;
+    entry.lastFailAt = now;
+    entry.lockedUntil = now + getRetryDelayMs(entry.fails);
+    loginAttemptState.set(key, entry);
+};
+
+const clearLoginFailures = (key) => {
+    loginAttemptState.delete(key);
+};
 
 // Flag-controlled migration/backfill for encrypted/hash fields on sensitive columns
 const APPLY_ENCRYPTION_MIGRATION =
@@ -545,8 +652,12 @@ app.post("/teacherLogin", async (req, res) => {
 
     try {
         const { email, password } = req.body;
+        const loginAttemptKey = getLoginAttemptKey(req, normalize(email || ""));
+        const throttleResponse = enforceLoginThrottle(req, res, loginAttemptKey);
+        if (throttleResponse) return throttleResponse;
 
         if (!email || !password) {
+            recordLoginFailure(loginAttemptKey);
             return res.status(401).send({
                 error: "Invalid credentials"
             });
@@ -608,10 +719,12 @@ app.post("/teacherLogin", async (req, res) => {
         }
 
         if (!teacher || !passwordCheck.isValid) {
+            recordLoginFailure(loginAttemptKey);
             return res.status(401).send({
                 error: "Invalid credentials"
             });
         }
+        clearLoginFailures(loginAttemptKey);
 
         const updates = {};
         const emailFromMainColumn = tryDecryptValue(teacher.email);
@@ -651,6 +764,7 @@ app.post("/teacherLogin", async (req, res) => {
                 }),
                 fullName: teacher.full_name
             },
+            accessToken: issueTeacherToken({ teacherId: teacher.id, emailHash: emailHash }),
             loginSuccess: true
         });
     } catch (error) {
@@ -670,8 +784,12 @@ app.post("/studentLogin", async (req, res) => {
 
     try {
         const { facultyNumber, password } = req.body;
+        const loginAttemptKey = getLoginAttemptKey(req, normalize(facultyNumber || ""));
+        const throttleResponse = enforceLoginThrottle(req, res, loginAttemptKey);
+        if (throttleResponse) return throttleResponse;
 
         if (!facultyNumber || !password) {
+            recordLoginFailure(loginAttemptKey);
             return res.status(401).send({
                 error: "Invalid credentials"
             });
@@ -767,10 +885,12 @@ app.post("/studentLogin", async (req, res) => {
         }
 
         if (!studentRow || !passwordCheck.isValid) {
+            recordLoginFailure(loginAttemptKey);
             return res.status(401).send({
                 error: "Invalid credentials"
             });
         }
+        clearLoginFailures(loginAttemptKey);
 
         const updates = {};
         const emailFromMainColumn = tryDecryptValue(studentRow.email);
@@ -892,16 +1012,20 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
 
         const duplicateCheck = await pool.query(
             `
-            SELECT id
-            FROM students
-            WHERE email_hash = $1 OR faculty_number_hash = $2
-            LIMIT 1
+            SELECT
+                EXISTS(SELECT 1 FROM students WHERE email_hash = $1) AS email_exists,
+                EXISTS(SELECT 1 FROM students WHERE faculty_number_hash = $2) AS faculty_number_exists
             `,
             [emailHash, facultyHash]
         );
-        if (duplicateCheck.rows.length > 0) {
+        const conflicts = {
+            email: Boolean(duplicateCheck.rows[0]?.email_exists),
+            facultyNumber: Boolean(duplicateCheck.rows[0]?.faculty_number_exists),
+        };
+        if (conflicts.email || conflicts.facultyNumber) {
             return res.status(409).send({
-                error: "Unable to register with provided details.",
+                error: "Registration failed. Please use a different email or faculty number.",
+                conflicts,
                 registrationSuccess: false
             });
         }
@@ -964,7 +1088,7 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
         if (error && error.code === '23505') {
             console.warn('⚠️ Duplicate registration attempt:', error.detail || error.constraint);
             return res.status(409).send({ 
-                error: "Unable to register with provided details.",
+                error: "Registration failed. Please use a different email or faculty number.",
                 registrationSuccess: false
             });
         }
@@ -1028,43 +1152,20 @@ app.get("/students", async (req, res) => {
 
 
 // ----------------- Class Creation Endpoint -----------------
-// Expects body: { name: string, teacherEmail?: string }
-// Authentication placeholder: teacher identified by provided email (until token/session implemented)
-app.post("/classes", async (req, res) => {
+// Expects body: { name: string, students?: Array }
+app.post("/classes", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
-    const { name, teacherEmail, students } = req.body || {};
+    const { name, students } = req.body || {};
 
     if (!name) {
         console.log("[CLASS CREATE] Validation failed: name is missing");
         return res.status(400).send({ error: "Class name is required" });
     }
-    if (!teacherEmail) {
-        console.log("[CLASS CREATE] Validation failed: teacherEmail is missing");
-        return res.status(400).send({ error: "Teacher email is required for now" });
-    }
-
     try {
-        console.log("[CLASS CREATE] Step 1: Resolve teacher by email");
-        console.log("[CLASS CREATE] teacherEmail:", teacherEmail);
-
-        const teacherEmailNorm = normalize(teacherEmail);
-        const teacherEmailHash = hashForLookup(teacherEmailNorm);
-
-        const teacherResult = await pool.query(
-            "SELECT id, email, full_name FROM teachers WHERE email_hash = $1",
-            [teacherEmailHash]
-        );
-
-        console.log("[CLASS CREATE] teacherResult.rows.length:", teacherResult.rows.length);
-        console.log("[CLASS CREATE] teacherResult.rows:", teacherResult.rows);
-        if (teacherResult.rows.length === 0) {
-            console.log("[CLASS CREATE] Teacher not found, aborting");
-            return res.status(404).send({ error: "Teacher not found" });
-        }
-        const teacherId = teacherResult.rows[0].id;
-        const teacherName = teacherResult.rows[0].full_name;
-        console.log("[CLASS CREATE] Teacher resolved -> id:", teacherId, "name:", teacherName);
+        console.log("[CLASS CREATE] Step 1: Resolve teacher from auth token");
+        const teacherId = req.authTeacherId;
+        console.log("[CLASS CREATE] Teacher resolved -> id:", teacherId);
 
         console.log("[CLASS CREATE] Step 2: Insert class");
         console.log("[CLASS CREATE] Insert payload:", { teacher_id: teacherId, name });
@@ -1125,11 +1226,11 @@ app.get("/classes", async (req, res) => {
 });
 
 // ----------------- Class Rename Endpoint -----------------
-// Expects body: { classId: number, name: string, teacherEmail: string }
-app.put("/classes", async (req, res) => {
+// Expects body: { classId: number, name: string }
+app.put("/classes", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
-    const { classId, name, teacherEmail } = req.body || {};
+    const { classId, name } = req.body || {};
 
     if (!classId) {
         return res.status(400).send({ error: "classId is required" });
@@ -1137,21 +1238,8 @@ app.put("/classes", async (req, res) => {
     if (!name) {
         return res.status(400).send({ error: "name is required" });
     }
-    if (!teacherEmail) {
-        return res.status(400).send({ error: "teacherEmail is required" });
-    }
-
     try {
-        const teacherEmailNorm = normalize(teacherEmail);
-        const teacherEmailHash = hashForLookup(teacherEmailNorm);
-        const teacherResult = await pool.query(
-            "SELECT id FROM teachers WHERE email_hash = $1",
-            [teacherEmailHash]
-        );
-        if (teacherResult.rows.length === 0) {
-            return res.status(404).send({ error: "Teacher not found" });
-        }
-        const teacherId = teacherResult.rows[0].id;
+        const teacherId = req.authTeacherId;
 
         const classResult = await pool.query(
             "SELECT id, teacher_id FROM classes WHERE id = $1",
@@ -1181,35 +1269,20 @@ app.put("/classes", async (req, res) => {
 });
 
 // ----------------- Class Deletion Endpoint -----------------
-// Expects body: { classId: number, teacherEmail: string }
+// Expects body: { classId: number }
 // Deletes class + related rows (class_students, attendances, attendance_timestamps)
-app.delete("/classes", async (req, res) => {
+app.delete("/classes", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
-    const { classId, teacherEmail } = req.body || {};
+    const { classId } = req.body || {};
 
     if (!classId) {
         return res.status(400).send({ error: "classId is required" });
     }
-    if (!teacherEmail) {
-        return res.status(400).send({ error: "teacherEmail is required" });
-    }
-
     const client = await pool.connect();
     try {
         await client.query("BEGIN");
-
-        const teacherEmailNorm = normalize(teacherEmail);
-        const teacherEmailHash = hashForLookup(teacherEmailNorm);
-        const teacherResult = await client.query(
-            "SELECT id FROM teachers WHERE email_hash = $1",
-            [teacherEmailHash]
-        );
-        if (teacherResult.rows.length === 0) {
-            await client.query("ROLLBACK");
-            return res.status(404).send({ error: "Teacher not found" });
-        }
-        const teacherId = teacherResult.rows[0].id;
+        const teacherId = req.authTeacherId;
 
         const classResult = await client.query(
             "SELECT id, teacher_id FROM classes WHERE id = $1",
@@ -1251,7 +1324,7 @@ app.delete("/classes", async (req, res) => {
 
 
 
-app.post("/class_students", async (req, res) => {
+app.post("/class_students", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
     var classId = req.body.classId;
@@ -1265,6 +1338,14 @@ app.post("/class_students", async (req, res) => {
         }
         if (!Array.isArray(students) || students.length === 0) {
             return res.status(400).send({ error: "students array is required" });
+        }
+
+        const ownership = await pool.query("SELECT teacher_id FROM classes WHERE id = $1", [classId]);
+        if (!ownership.rows.length) {
+            return res.status(404).send({ error: "Class not found" });
+        }
+        if (ownership.rows[0].teacher_id !== req.authTeacherId) {
+            return res.status(403).send({ error: "You do not have permission to modify this class" });
         }
 
         const assignmentResult = await addStudentsToClass(classId, students);
@@ -1725,24 +1806,19 @@ app.get("/attendance/summary", async (req, res) => {
 
 
 // ----------------- Remove Student from Class Endpoint -----------------
-// Expects body: { class_id: number, faculty_number: string, teacherEmail: string }
+// Expects body: { class_id: number, faculty_number: string }
 // Validates that teacher owns the class before deleting
-app.post("/class_students/remove", async (req, res) => {
+app.post("/class_students/remove", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
     const classId = req.body.class_id ?? req.body.classId;
     const facultyNumberRaw = req.body.faculty_number ?? req.body.facultyNumber;
-    const teacherEmail = req.body.teacherEmail;
     const facultyNumber = facultyNumberRaw ? String(facultyNumberRaw).trim() : facultyNumberRaw;
 
     // Validate required fields
     if (!classId || !facultyNumber) {
         return res.status(400).send({ error: "class_id and faculty_number are required" });
     }
-    if (!teacherEmail) {
-        return res.status(400).send({ error: "teacherEmail is required for authorization" });
-    }
-
     try {
         // Step 0: Get student ID from faculty number (hashed lookup)
         const facultyNorm = normalize(facultyNumber);
@@ -1757,17 +1833,7 @@ app.post("/class_students/remove", async (req, res) => {
         const student_id = studentResult.rows[0].id;
         console.log("Student ID found:", student_id);
 
-        // Step 1: Verify teacher exists and get teacher ID
-        const teacherEmailNorm = normalize(teacherEmail);
-        const teacherEmailHash = hashForLookup(teacherEmailNorm);
-        const teacherResult = await pool.query(
-            "SELECT id FROM teachers WHERE email_hash = $1",
-            [teacherEmailHash]
-        );
-        if (teacherResult.rows.length === 0) {
-            return res.status(401).send({ error: "Teacher not found" });
-        }
-        const teacherId = teacherResult.rows[0].id;
+        const teacherId = req.authTeacherId;
         console.log("Teacher ID found:", teacherId);
 
         // Step 2: Verify teacher owns the class
@@ -1962,15 +2028,18 @@ app.get("/get_student_attendance_count", async (req, res) => {
 
 
 
-app.post("/update_completed_classes_count", async (req, res) => {
+app.post("/update_completed_classes_count", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
     
     var classId = req.body.class_id;
 
     console.log("classId:", classId);
 
-    const sql = `UPDATE classes SET completed_classes_count = completed_classes_count + 1 WHERE id = $1`;
-    const result  = await pool.query(sql, [classId]);
+    const sql = `UPDATE classes SET completed_classes_count = completed_classes_count + 1 WHERE id = $1 AND teacher_id = $2`;
+    const result  = await pool.query(sql, [classId, req.authTeacherId]);
+    if (result.rowCount === 0) {
+        return res.status(404).send({ error: "Class not found for this teacher" });
+    }
 
     console.log('Query result:', result.rows);
     
