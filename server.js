@@ -28,6 +28,10 @@ const {
     buildCheckEmailHandler,
     buildCheckFacultyNumberHandler,
 } = require("./security/studentEndpointHandlers");
+const {
+    mapRegistrationUniqueViolation,
+    insertStudentWithIdCollisionRecovery,
+} = require("./security/registrationDb");
 
 if (!String(process.env.AUTH_PEPPER || "").trim()) {
     throw new Error("AUTH_PEPPER is required");
@@ -984,6 +988,7 @@ app.post("/students/check-faculty-number", checkRouteRateLimit, async (req, res)
 
 app.post("/registration", registrationRateLimit, async (req, res) => {
     logRequestStart(req);
+    const requestId = crypto.randomUUID();
 
     try {
         const user = req.body;
@@ -1041,9 +1046,7 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
             });
         }
 
-        const result = await pool.query(
-            // syntax for reserved word "group" needs quotes
-            `
+        const insertSql = `
             INSERT INTO students (
                 full_name,
                 email,
@@ -1066,27 +1069,33 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
             )
             RETURNING full_name, email, faculty_number, "group", course, faculty, level, specialization
-            `,
-            [
-                fullName,
-                emailEncrypted,
-                facultyEncrypted,
-                passwordFields.password,
-                passwordFields.password_hash,
-                passwordFields.hash_algorithm,
-                passwordFields.password_updated_at,
-                user.level,
-                user.faculty,
-                user.specialization,
-                String(groupValidation.parsed),
-                String(courseValue),
-                new Date(),
-                emailEncrypted,
-                emailHash,
-                facultyEncrypted,
-                facultyHash,
-            ]
-        );
+        `;
+        const insertValues = [
+            fullName,
+            emailEncrypted,
+            facultyEncrypted,
+            passwordFields.password,
+            passwordFields.password_hash,
+            passwordFields.hash_algorithm,
+            passwordFields.password_updated_at,
+            user.level,
+            user.faculty,
+            user.specialization,
+            String(groupValidation.parsed),
+            String(courseValue),
+            new Date(),
+            emailEncrypted,
+            emailHash,
+            facultyEncrypted,
+            facultyHash,
+        ];
+        const result = await insertStudentWithIdCollisionRecovery({
+            pool,
+            insertSql,
+            insertValues,
+            requestId,
+            logger: console,
+        });
 
         const student = {
             ...result.rows[0],
@@ -1095,6 +1104,31 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
         };
         return res.send({ message: "User registration successful", student, registrationSuccess: true });
     } catch (error) {
+        const mapped = mapRegistrationUniqueViolation(error);
+        if (mapped && mapped.type === "duplicate_email") {
+            console.warn("[REGISTRATION][DUPLICATE_EMAIL]", { requestId, constraint: mapped.constraint });
+            return res.status(409).send({
+                error: "Registration failed. Please use a different email or faculty number.",
+                conflicts: { email: true, facultyNumber: false },
+                registrationSuccess: false
+            });
+        }
+        if (mapped && mapped.type === "duplicate_faculty_number") {
+            console.warn("[REGISTRATION][DUPLICATE_FACULTY]", { requestId, constraint: mapped.constraint });
+            return res.status(409).send({
+                error: "Registration failed. Please use a different email or faculty number.",
+                conflicts: { email: false, facultyNumber: true },
+                registrationSuccess: false
+            });
+        }
+        if (mapped && mapped.type === "id_collision") {
+            console.error("[REGISTRATION][ID_COLLISION_UNRECOVERED]", {
+                requestId,
+                constraint: mapped.constraint,
+                retryFailed: Boolean(error.registrationRetryFailed),
+            });
+            return res.status(500).send({ error: "Internal server error", registrationSuccess: false });
+        }
         // Unique violation (email or other unique columns)
         if (error && error.code === '23505') {
             console.warn('⚠️ Duplicate registration attempt:', error.detail || error.constraint);
@@ -2087,4 +2121,5 @@ app.post("/backup/drop-encryption-columns", dropEncryptionColumns);
 // ----------------- Database Backup Import Endpoint -----------------
 app.post("/backup/import", importBackup);
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+
 
