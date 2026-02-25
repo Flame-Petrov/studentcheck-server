@@ -6,6 +6,8 @@ const {
 } = require("../security/teacherAuth");
 
 const TEST_SECRET = "test-secret-123";
+const TEST_ISSUER = "studentcheck-server";
+const TEST_AUDIENCE = "studentcheck-frontend";
 
 const run = async (name, fn) => {
     try {
@@ -23,12 +25,27 @@ const runTests = async () => {
     await run("login token signing + verify works", async () => {
         const token = signAuthToken({
             secret: TEST_SECRET,
-            payload: { sub: "10", teacherId: 10, role: "teacher", email: "t@example.com", iat: now, exp: now + 60 },
+            payload: {
+                sub: "10",
+                teacherId: 10,
+                role: "teacher",
+                email: "t@example.com",
+                iss: TEST_ISSUER,
+                aud: TEST_AUDIENCE,
+                iat: now,
+                exp: now + 60,
+            },
         });
-        const payload = verifyAuthToken({ token, secret: TEST_SECRET });
-        assert.equal(payload.sub, "10");
-        assert.equal(payload.teacherId, 10);
-        assert.equal(payload.role, "teacher");
+        const verification = verifyAuthToken({
+            token,
+            secret: TEST_SECRET,
+            issuer: TEST_ISSUER,
+            audience: TEST_AUDIENCE,
+        });
+        assert.equal(verification.ok, true);
+        assert.equal(verification.payload.sub, "10");
+        assert.equal(verification.payload.teacherId, 10);
+        assert.equal(verification.payload.role, "teacher");
     });
 
     await run("missing auth header -> missing bearer token", async () => {
@@ -46,10 +63,23 @@ const runTests = async () => {
     await run("expired token -> invalid/expired on verify path", async () => {
         const token = signAuthToken({
             secret: TEST_SECRET,
-            payload: { sub: "10", role: "teacher", iat: now - 120, exp: now - 60 },
+            payload: {
+                sub: "10",
+                role: "teacher",
+                iss: TEST_ISSUER,
+                aud: TEST_AUDIENCE,
+                iat: now - 120,
+                exp: now - 60,
+            },
         });
-        const payload = verifyAuthToken({ token, secret: TEST_SECRET });
-        assert.equal(payload, null);
+        const verification = verifyAuthToken({
+            token,
+            secret: TEST_SECRET,
+            issuer: TEST_ISSUER,
+            audience: TEST_AUDIENCE,
+        });
+        assert.equal(verification.ok, false);
+        assert.equal(verification.reason, "expired");
     });
 };
 

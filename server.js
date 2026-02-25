@@ -37,13 +37,18 @@ const {
     verifyAuthToken,
     parseAuthorizationHeader,
 } = require("./security/teacherAuth");
+const {
+    JWT_SECRET,
+    JWT_ISSUER,
+    JWT_AUDIENCE,
+    JWT_EXPIRES_IN_SECONDS,
+} = require("./security/jwtConfig");
 
 if (!String(process.env.AUTH_PEPPER || "").trim()) {
     throw new Error("AUTH_PEPPER is required");
 }
-const AUTH_TOKEN_SECRET = String(process.env.AUTH_TOKEN_SECRET || process.env.AUTH_PEPPER || "").trim();
-if (!AUTH_TOKEN_SECRET) {
-    throw new Error("AUTH_TOKEN_SECRET is required");
+if (!JWT_SECRET) {
+    throw new Error("JWT_SECRET (or AUTH_TOKEN_SECRET) is required");
 }
 
 const app = express();
@@ -266,16 +271,18 @@ const loginAttemptState = new Map();
 
 const issueTeacherToken = ({ teacherId, emailHash, email }) => {
     const now = Math.floor(Date.now() / 1000);
-    const expiresInSeconds = 12 * 60 * 60;
+    const expiresInSeconds = JWT_EXPIRES_IN_SECONDS;
     return {
         token: signAuthToken({
-            secret: AUTH_TOKEN_SECRET,
+            secret: JWT_SECRET,
             payload: {
                 sub: String(teacherId),
                 teacherId: Number(teacherId),
                 role: "teacher",
                 email,
                 emailHash,
+                iss: JWT_ISSUER,
+                aud: JWT_AUDIENCE,
                 iat: now,
                 exp: now + expiresInSeconds,
             },
@@ -304,16 +311,30 @@ const requireTeacherAuth = async (req, res, next) => {
         return res.status(401).send({ error: parsed.error });
     }
 
-    const payload = verifyAuthToken({
+    const verification = verifyAuthToken({
         token: parsed.token,
-        secret: AUTH_TOKEN_SECRET,
+        secret: JWT_SECRET,
+        issuer: JWT_ISSUER,
+        audience: JWT_AUDIENCE,
     });
-    if (!payload || payload.role !== "teacher" || !payload.sub) {
+    if (!verification.ok) {
         logAuthEvent({
             requestId,
             endpoint: req.originalUrl,
             authHeaderPresent: true,
             tokenVerificationStatus: "invalid_or_expired",
+            verifyReason: verification.reason,
+            statusCode: 401,
+        });
+        return res.status(401).send({ error: "Invalid or expired token" });
+    }
+    const payload = verification.payload;
+    if (payload.role !== "teacher" || !payload.sub) {
+        logAuthEvent({
+            requestId,
+            endpoint: req.originalUrl,
+            authHeaderPresent: true,
+            tokenVerificationStatus: "invalid_claims",
             statusCode: 401,
         });
         return res.status(401).send({ error: "Invalid or expired token" });
