@@ -4,7 +4,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node tests/passwordAuth.test.js && node tests/studentValidationAndChecks.test.js && node tests/registrationDb.test.js && node tests/teacherAuth.test.js",
+    "test": "node tests/passwordAuth.test.js && node tests/studentValidationAndChecks.test.js && node tests/registrationDb.test.js && node tests/teacherAuth.test.js && node tests/classStudentsPostHandler.test.js",
     "backup:db": "node scripts/createDatabaseBackup.js",
     "restore:db": "node scripts/restoreDatabaseBackup.js",
     "backup:encrypt": "node scripts/encryptBackupData.js",

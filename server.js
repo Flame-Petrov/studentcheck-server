@@ -37,6 +37,7 @@ const {
     verifyAuthToken,
     parseAuthorizationHeader,
 } = require("./security/teacherAuth");
+const { buildPostClassStudentsHandler } = require("./security/classStudentsPostHandler");
 const {
     JWT_SECRET,
     JWT_ISSUER,
@@ -1447,75 +1448,16 @@ app.delete("/classes", requireTeacherAuth, async (req, res) => {
 
 
 
+const postClassStudentsHandler = buildPostClassStudentsHandler({
+    pool,
+    normalize,
+    hashForLookup,
+    addStudentsToClass,
+    logger: console,
+});
 app.post("/class_students", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
-
-    var classId = req.body.classId;
-    var students = req.body.students; // array of student
-
-    console.log("[CLASS_STUDENTS_MUTATION]", {
-        requestId: req.authRequestId || null,
-        endpoint: "/class_students",
-        authHeaderPresent: Boolean(req.headers.authorization),
-        teacherId: req.authTeacherId || null,
-        teacherEmail: req.user?.email || null,
-        classId,
-    });
-
-    try {
-        if (!classId) {
-            return res.status(400).send({ error: "classId is required" });
-        }
-        if (!Array.isArray(students) || students.length === 0) {
-            return res.status(400).send({ error: "students array is required" });
-        }
-
-        const ownership = await pool.query("SELECT teacher_id FROM classes WHERE id = $1", [classId]);
-        if (!ownership.rows.length) {
-            return res.status(404).send({ error: "Class not found" });
-        }
-        if (ownership.rows[0].teacher_id !== req.authTeacherId) {
-            console.log("[CLASS_STUDENTS_MUTATION]", {
-                requestId: req.authRequestId || null,
-                endpoint: "/class_students",
-                ownership: "mismatch",
-                classId,
-                authTeacherId: req.authTeacherId,
-                classOwnerTeacherId: ownership.rows[0].teacher_id,
-                statusCode: 403,
-            });
-            return res.status(403).send({ error: "Forbidden: class does not belong to authenticated teacher" });
-        }
-
-        const assignmentResult = await addStudentsToClass(classId, students);
-        console.log("[CLASS STUDENTS] Assignment result:", assignmentResult);
-        console.log("[CLASS_STUDENTS_MUTATION]", {
-            requestId: req.authRequestId || null,
-            endpoint: "/class_students",
-            ownership: "ok",
-            classId: Number(classId),
-            addedCount: Number(assignmentResult.assignedCount || 0),
-            statusCode: 200,
-        });
-
-        return res.status(200).send({
-            success: true,
-            classId: Number(classId),
-            addedCount: Number(assignmentResult.assignedCount || 0),
-        });
-    } catch (error) {
-        console.error("[CLASS_STUDENTS_MUTATION][DB_ERROR]", {
-            requestId: req.authRequestId || null,
-            endpoint: "/class_students",
-            classId,
-            statusCode: 500,
-            code: error?.code,
-        });
-        return res.status(500).send({ error: "Internal server error" });
-    }
-    
-
-    
+    return postClassStudentsHandler(req, res);
 });
 
 
