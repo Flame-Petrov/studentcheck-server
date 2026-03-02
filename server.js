@@ -1323,8 +1323,39 @@ app.post("/classes", requireTeacherAuth, async (req, res) => {
 // (Optional helper) List classes for a teacher by email query param: /classes?teacherEmail=...
 app.get("/classes", async (req, res) => {
     logRequestStart(req);
-    const { teacherEmail } = req.query;
+    const { teacherEmail, class_id, classId } = req.query;
     try {
+        const requestedClassIdRaw = class_id ?? classId;
+        if (requestedClassIdRaw !== undefined) {
+            const requestedClassId = Number.parseInt(String(requestedClassIdRaw), 10);
+            if (!Number.isInteger(requestedClassId) || requestedClassId <= 0) {
+                return res.status(400).send({ error: "class_id must be a positive integer" });
+            }
+
+            const classResult = await pool.query(
+                `
+                SELECT
+                    id,
+                    teacher_id,
+                    name,
+                    COALESCE(completed_classes_count, 0) AS completed_classes_count
+                FROM classes
+                WHERE id = $1
+                `,
+                [requestedClassId]
+            );
+            if (classResult.rows.length === 0) {
+                return res.status(404).send({ error: "Class not found" });
+            }
+
+            const row = classResult.rows[0];
+            return res.send({
+                message: "Class fetched",
+                class: row,
+                classes: [row],
+            });
+        }
+
         if (teacherEmail) {
             const teacherEmailNorm = normalize(teacherEmail);
             const teacherEmailHash = hashForLookup(teacherEmailNorm);
@@ -1335,12 +1366,34 @@ app.get("/classes", async (req, res) => {
             const teacherId = t.rows[0].id;
             console.log("Fetching classes for teacher ID:", teacherId);
 
-            const classes = await pool.query("SELECT id, teacher_id, name FROM classes WHERE teacher_id = $1 ORDER BY id DESC", [teacherId]);
+            const classes = await pool.query(
+                `
+                SELECT
+                    id,
+                    teacher_id,
+                    name,
+                    COALESCE(completed_classes_count, 0) AS completed_classes_count
+                FROM classes
+                WHERE teacher_id = $1
+                ORDER BY id DESC
+                `,
+                [teacherId]
+            );
             console.log("Classes fetched:", classes.rows);
             
             return res.send({ message: "Classes fetched", classes: classes.rows });
         } else {
-            const classes = await pool.query("SELECT id, teacher_id, name FROM classes ORDER BY id DESC");
+            const classes = await pool.query(
+                `
+                SELECT
+                    id,
+                    teacher_id,
+                    name,
+                    COALESCE(completed_classes_count, 0) AS completed_classes_count
+                FROM classes
+                ORDER BY id DESC
+                `
+            );
             return res.send({ message: "All classes fetched", classes: classes.rows });
         }
     } catch (error) {
