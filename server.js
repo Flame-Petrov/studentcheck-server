@@ -1919,17 +1919,44 @@ app.post("/class_students/remove", requireTeacherAuth, async (req, res) => {
         return res.status(400).send({ error: "class_id and faculty_number are required" });
     }
     try {
-        // Step 0: Get student ID from faculty number (hashed lookup)
+        // Step 0: Resolve student by faculty number.
+        // Fast path uses hash, fallback handles legacy rows where hash/encrypted fields are missing.
         const facultyNorm = normalize(facultyNumber);
         const facultyHash = hashForLookup(facultyNorm);
-        const studentResult = await pool.query(
-            "SELECT id FROM students WHERE faculty_number_hash = $1",
+        const fastStudentResult = await pool.query(
+            `
+            SELECT id, faculty_number, faculty_number_encrypted, faculty_number_hash
+            FROM students
+            WHERE faculty_number_hash = $1
+            LIMIT 1
+            `,
             [facultyHash]
         );
-        if (studentResult.rows.length === 0) {
+
+        let resolvedStudentRow = fastStudentResult.rows[0] || null;
+        if (!resolvedStudentRow) {
+            const fallbackCandidates = await pool.query(
+                `
+                SELECT id, faculty_number, faculty_number_encrypted, faculty_number_hash
+                FROM students
+                ORDER BY id ASC
+                LIMIT 10000
+                `
+            );
+            resolvedStudentRow = fallbackCandidates.rows.find((row) => {
+                return identifierMatches({
+                    inputNormalized: facultyNorm,
+                    rowHash: row.faculty_number_hash,
+                    rowPlain: row.faculty_number,
+                    rowEncrypted: row.faculty_number_encrypted,
+                });
+            }) || null;
+        }
+
+        if (!resolvedStudentRow) {
             return res.status(404).send({ error: "Student not found with this faculty number" });
         }
-        const student_id = studentResult.rows[0].id;
+        const student_id = resolvedStudentRow.id;
         console.log("Student ID found:", student_id);
 
         const teacherId = req.authTeacherId;
