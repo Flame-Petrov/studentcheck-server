@@ -1372,7 +1372,8 @@ app.put("/classes", requireTeacherAuth, async (req, res) => {
         if (classResult.rows.length === 0) {
             return res.status(404).send({ error: "Class not found" });
         }
-        if (classResult.rows[0].teacher_id !== teacherId) {
+        const classTeacherId = Number.parseInt(String(classResult.rows[0].teacher_id), 10);
+        if (!Number.isInteger(classTeacherId) || classTeacherId !== teacherId) {
             return res.status(403).send({ error: "You do not have permission to rename this class" });
         }
 
@@ -1416,7 +1417,8 @@ app.delete("/classes", requireTeacherAuth, async (req, res) => {
             await client.query("ROLLBACK");
             return res.status(404).send({ error: "Class not found" });
         }
-        if (classResult.rows[0].teacher_id !== teacherId) {
+        const classTeacherId = Number.parseInt(String(classResult.rows[0].teacher_id), 10);
+        if (!Number.isInteger(classTeacherId) || classTeacherId !== teacherId) {
             await client.query("ROLLBACK");
             return res.status(403).send({ error: "You do not have permission to delete this class" });
         }
@@ -1970,8 +1972,8 @@ app.post("/class_students/remove", requireTeacherAuth, async (req, res) => {
         if (classResult.rows.length === 0) {
             return res.status(404).send({ error: "Class not found" });
         }
-        const classTeacherId = classResult.rows[0].teacher_id;
-        if (classTeacherId !== teacherId) {
+        const classTeacherId = Number.parseInt(String(classResult.rows[0].teacher_id), 10);
+        if (!Number.isInteger(classTeacherId) || classTeacherId !== teacherId) {
             return res.status(403).send({ error: "You do not have permission to modify this class" });
         }
         console.log("Teacher ownership verified for class:", classId);
