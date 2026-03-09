@@ -971,6 +971,64 @@ const getResolvedEmailForResponse = (row) => {
     return row.email;
 };
 
+const canonicalizeFacultyNumberForResponse = (value) => {
+    if (value === undefined || value === null) return null;
+    const trimmed = String(value).trim();
+    if (!trimmed) return null;
+    return trimmed.toUpperCase();
+};
+
+const parsePositiveInteger = (value) => {
+    const parsed = Number.parseInt(String(value), 10);
+    if (!Number.isInteger(parsed) || parsed <= 0) return null;
+    return parsed;
+};
+
+const getResolvedFacultyNumberForResponse = (row = {}) => {
+    const fromEncryptedColumn = tryDecryptValue(row.faculty_number_encrypted);
+    if (fromEncryptedColumn) return canonicalizeFacultyNumberForResponse(fromEncryptedColumn);
+
+    const fromMainColumn = tryDecryptValue(row.faculty_number);
+    if (fromMainColumn) return canonicalizeFacultyNumberForResponse(fromMainColumn);
+
+    return canonicalizeFacultyNumberForResponse(row.faculty_number);
+};
+
+const withStudentResponseIdentifiers = (row = {}) => {
+    const response = { ...row };
+    const studentIdRaw = row.id ?? row.student_id;
+    const studentId = parsePositiveInteger(studentIdRaw) ?? studentIdRaw;
+    const facultyNumber = getResolvedFacultyNumberForResponse(row);
+
+    if (studentId !== undefined && studentId !== null && studentId !== "") {
+        response.id = studentId;
+        response.student_id = studentId;
+    }
+
+    if (facultyNumber) {
+        response.faculty_number = facultyNumber;
+        response.facultyNumber = facultyNumber;
+    }
+
+    return response;
+};
+
+const withAttendanceStudentIdentifiers = (row = {}) => {
+    const response = { ...row };
+    const studentId = parsePositiveInteger(row.student_id);
+    const facultyNumber = getResolvedFacultyNumberForResponse(row);
+
+    if (studentId) {
+        response.student_id = studentId;
+    }
+    if (facultyNumber) {
+        response.faculty_number = facultyNumber;
+        response.facultyNumber = facultyNumber;
+    }
+
+    return response;
+};
+
 const updateAuthFieldsById = async (tableName, id, updates) => {
     const fields = Object.keys(updates || {});
     if (fields.length === 0) return;
@@ -1403,7 +1461,7 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
             )
-            RETURNING full_name, email, faculty_number, "group", course, faculty, level, specialization
+            RETURNING id, full_name, email, faculty_number, "group", course, faculty, level, specialization
         `;
         const insertValues = [
             fullName,
@@ -1432,11 +1490,11 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
             logger: console,
         });
 
-        const student = {
+        const student = withStudentResponseIdentifiers({
             ...result.rows[0],
             email: normalizedEmail,
             faculty_number: normalizedFacultyNumber,
-        };
+        });
         return res.send({ message: "User registration successful", student, registrationSuccess: true });
     } catch (error) {
         const mapped = mapRegistrationUniqueViolation(error);
@@ -1522,7 +1580,7 @@ app.get("/students", async (req, res) => {
         const sql = `SELECT * FROM students ${whereSql} ORDER BY id DESC`;
 
         const result = await pool.query(sql, params);
-        const students = result.rows.map(inflateStudent);
+        const students = result.rows.map((row) => withStudentResponseIdentifiers(inflateStudent(row)));
         return res.send({ students });
     } catch (error) {
         console.error("❌ Database error fetching students:", error);
@@ -1765,34 +1823,43 @@ app.post("/class_students", requireTeacherAuth, async (req, res) => {
 
 app.get("/class_students", async (req, res) => {
     logRequestStart(req);
-    var classId = req.query.class_id;
+    const classId = req.query.class_id;
     if (!classId) {
         return res.status(400).send({ error: "class_id query parameter is required" });
     }
-    var result  = await pool.query("SELECT * FROM class_students WHERE class_id = $1", [classId]);
+    try {
+        const { rows } = await pool.query(
+            `
+            SELECT
+                s.id,
+                s.id AS student_id,
+                s.full_name,
+                s.email,
+                s.email_encrypted,
+                s.faculty_number,
+                s.faculty_number_encrypted,
+                s."group",
+                s.course,
+                s.faculty,
+                s.level,
+                s.specialization
+            FROM class_students cs
+            JOIN students s ON s.id = cs.student_id
+            WHERE cs.class_id = $1
+            ORDER BY s.full_name ASC, s.id ASC
+            `,
+            [classId]
+        );
 
-    // get student details for each student_id
-    var studentIds = [];
-    result.rows.forEach(row => {
-        var studentId = row.student_id;
-        studentIds.push(studentId);
-    });
-
-
-    // Fetch details for these students
-    let studentsDetails = [];
-    if (studentIds.length > 0) {
-        const placeholders = studentIds.map((_, i) => `$${i + 1}`).join(',');
-        const sql = `SELECT id, full_name, faculty_number FROM students WHERE id IN (${placeholders})`;
-        const detailsRes = await pool.query(sql, studentIds);
-        studentsDetails = detailsRes.rows;
+        const students = rows.map((row) => withStudentResponseIdentifiers(inflateStudent(row)));
+        return res.send({
+            message: "Class students fetched",
+            students
+        });
+    } catch (error) {
+        console.error("Database error fetching class students:", error);
+        return res.status(500).send({ error: "Internal server error" });
     }
-
-
-    return res.send({
-        message: "Class students fetched",
-        students: studentsDetails // add names and faculty numbers by id
-    });
 });
 
 
@@ -2039,6 +2106,7 @@ app.get("/attendance/timestamps", async (req, res) => {
                 at.student_id,
                 s.full_name,
                 s.faculty_number,
+                s.faculty_number_encrypted,
                 at.joined_at,
                 at.left_at
             FROM attendance_timestamps at
@@ -2047,7 +2115,8 @@ app.get("/attendance/timestamps", async (req, res) => {
             ORDER BY at.joined_at DESC
         `, [classIdNum]);
 
-        return res.send({ timestamps: rows.rows });
+        const timestamps = rows.rows.map((row) => withAttendanceStudentIdentifiers(row));
+        return res.send({ timestamps });
     } catch (error) {
         console.error("❌ Database error fetching attendance timestamps:", error);
         return res.status(500).send({ error: "Internal server error" });
@@ -2101,15 +2170,23 @@ app.get("/attendance/history", async (req, res) => {
 
         const { rows } = await pool.query(
             `
-            SELECT joined_at, left_at
-            FROM attendance_timestamps
-            WHERE class_id = $1 AND student_id = $2
-            ORDER BY joined_at DESC
+            SELECT
+                at.class_id,
+                at.student_id,
+                s.faculty_number,
+                s.faculty_number_encrypted,
+                at.joined_at,
+                at.left_at
+            FROM attendance_timestamps at
+            JOIN students s ON s.id = at.student_id
+            WHERE at.class_id = $1 AND at.student_id = $2
+            ORDER BY at.joined_at DESC
             `,
             [classIdNum, resolvedStudentId]
         );
 
-        return res.status(200).send({ records: rows });
+        const records = rows.map((row) => withAttendanceStudentIdentifiers(row));
+        return res.status(200).send({ records });
     } catch (error) {
         console.error("❌ Database error fetching attendance history:", error);
         return res.status(500).send({ error: "Internal server error" });
@@ -2144,6 +2221,7 @@ app.get("/attendance/summary", async (req, res) => {
                 a.student_id,
                 s.full_name,
                 s.faculty_number,
+                s.faculty_number_encrypted,
                 COALESCE(a.count, 0) AS attendance_count
             FROM attendances a
             JOIN students s ON a.student_id = s.id
@@ -2153,7 +2231,8 @@ app.get("/attendance/summary", async (req, res) => {
             [classIdNum]
         );
 
-        return res.status(200).send({ items: rows });
+        const items = rows.map((row) => withAttendanceStudentIdentifiers(row));
+        return res.status(200).send({ items });
     } catch (error) {
         console.error("❌ Database error fetching attendance summary:", error);
         return res.status(500).send({ error: "Internal server error" });
