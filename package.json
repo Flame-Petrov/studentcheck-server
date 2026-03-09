@@ -4,12 +4,13 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node tests/passwordAuth.test.js && node tests/studentValidationAndChecks.test.js && node tests/registrationDb.test.js && node tests/teacherAuth.test.js && node tests/classStudentsPostHandler.test.js",
+    "test": "node tests/passwordAuth.test.js && node tests/studentValidationAndChecks.test.js && node tests/registrationDb.test.js && node tests/teacherAuth.test.js && node tests/classStudentsPostHandler.test.js && node tests/studentSerialization.test.js",
     "backup:db": "node scripts/createDatabaseBackup.js",
     "restore:db": "node scripts/restoreDatabaseBackup.js",
     "backup:encrypt": "node scripts/encryptBackupData.js",
     "backup:decrypt": "node scripts/decryptBackupData.js",
     "backup:encrypt-users": "node scripts/encryptUserFieldsBackup.js",
+    "db:backfill-mixed-student-emails": "node scripts/backfillMixedStudentEmails.js",
     "db:drop-encryption-columns": "node scripts/dropEncryptionColumns.js",
     "db:load-table": "node scripts/loadTableFromFile.js",
     "db:sync-students-seq": "node scripts/syncStudentsIdSequence.js"

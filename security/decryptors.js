@@ -1,5 +1,7 @@
 const { decrypt } = require("./cryptoService");
 
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 const canonicalizeFacultyNumber = (value) => {
     if (value === undefined || value === null) return null;
     const trimmed = String(value).trim();
@@ -13,42 +15,69 @@ const parseStudentId = (value) => {
     return parsed;
 };
 
-// Inflate a student row, preferring encrypted fields when present
-const inflateStudent = (row) => {
-    let email = row.email;
-    let facultyNumber = row.faculty_number;
-
+const tryDecryptWithServerKey = (value) => {
+    if (typeof value !== "string") return null;
+    const raw = value.trim();
+    if (!raw) return null;
     try {
-        if (row.email_encrypted) {
-            email = decrypt(row.email_encrypted);
-        } else if (row.email) {
-            email = decrypt(row.email);
-        }
-    } catch (e) {
-        // Fallback to legacy plaintext if decryption fails
+        return decrypt(raw);
+    } catch {
+        return null;
+    }
+};
+
+const normalizeEmailIfValid = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    if (!EMAIL_REGEX.test(raw)) return null;
+    return raw.toLowerCase();
+};
+
+const resolveEmailForApi = (raw) => {
+    const direct = normalizeEmailIfValid(raw);
+    if (direct) return direct;
+
+    const decrypted = tryDecryptWithServerKey(raw);
+    const decryptedNormalized = normalizeEmailIfValid(decrypted);
+    if (decryptedNormalized) return decryptedNormalized;
+
+    return null;
+};
+
+const resolveFacultyNumberForApi = (row = {}) => {
+    const candidates = [
+        row.faculty_number_encrypted,
+        row.faculty_number,
+        row.facultyNumber,
+    ];
+
+    for (const candidate of candidates) {
+        if (candidate === undefined || candidate === null) continue;
+
+        const decrypted = tryDecryptWithServerKey(candidate);
+        const resolved = canonicalizeFacultyNumber(decrypted || candidate);
+        if (resolved) return resolved;
     }
 
-    try {
-        if (row.faculty_number_encrypted) {
-            facultyNumber = decrypt(row.faculty_number_encrypted);
-        } else if (row.faculty_number) {
-            facultyNumber = decrypt(row.faculty_number);
-        }
-    } catch (e) {
-        // Fallback to legacy plaintext if decryption fails
-    }
+    return null;
+};
 
-    const idValue = parseStudentId(row.id ?? row.student_id) ?? row.id ?? row.student_id;
-    const normalizedFacultyNumber = canonicalizeFacultyNumber(facultyNumber);
+const serializeStudent = (row = {}) => {
+    const studentIdRaw = row.id ?? row.student_id;
+    const studentId = parseStudentId(studentIdRaw) ?? studentIdRaw ?? null;
+    const facultyNumber = resolveFacultyNumberForApi(row);
+    const email = resolveEmailForApi(row.email) || resolveEmailForApi(row.email_encrypted);
+    const rawEmail = row.email_encrypted ?? row.email ?? null;
 
     return {
-        id: idValue,
-        student_id: idValue,
-        full_name: row.full_name,
+        id: studentId,
+        student_id: studentId,
+        faculty_number: facultyNumber,
+        facultyNumber: facultyNumber,
+        full_name: row.full_name || "",
+        group: row.group_name || row.group || "",
         email,
-        faculty_number: normalizedFacultyNumber,
-        facultyNumber: normalizedFacultyNumber,
-        group: row.group,
+        email_encrypted: rawEmail,
         course: row.course,
         faculty: row.faculty,
         level: row.level,
@@ -56,7 +85,13 @@ const inflateStudent = (row) => {
     };
 };
 
+// Backward-compatible alias used by existing route handlers.
+const inflateStudent = (row = {}) => serializeStudent(row);
+
 module.exports = {
     inflateStudent,
+    resolveEmailForApi,
+    serializeStudent,
+    tryDecryptWithServerKey,
 };
 

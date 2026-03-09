@@ -12,7 +12,7 @@ const { createStripeService } = require("./stripeService");
 const { createBackupHandlers } = require("./backupService");
 const { createBillingRouter, createBillingWebhookHandler } = require("./billingRoutes");
 const { encryptRaw, decrypt, hashForLookup, hashExactForLookup, normalize } = require("./security/cryptoService");
-const { inflateStudent } = require("./security/decryptors");
+const { resolveEmailForApi, serializeStudent } = require("./security/decryptors");
 const {
     ARGON2_ALGORITHM,
     buildArgon2PasswordFields,
@@ -962,13 +962,13 @@ const identifierMatches = ({ inputNormalized, rowHash, rowPlain, rowEncrypted })
 };
 
 const getResolvedEmailForResponse = (row) => {
-    const fromEncryptedColumn = tryDecryptValue(row.email_encrypted);
+    const fromMainColumn = resolveEmailForApi(row?.email);
+    if (fromMainColumn) return fromMainColumn;
+
+    const fromEncryptedColumn = resolveEmailForApi(row?.email_encrypted);
     if (fromEncryptedColumn) return fromEncryptedColumn;
 
-    const fromEmailColumn = tryDecryptValue(row.email);
-    if (fromEmailColumn) return fromEmailColumn;
-
-    return row.email;
+    return null;
 };
 
 const canonicalizeFacultyNumberForResponse = (value) => {
@@ -994,20 +994,21 @@ const getResolvedFacultyNumberForResponse = (row = {}) => {
     return canonicalizeFacultyNumberForResponse(row.faculty_number);
 };
 
-const withStudentResponseIdentifiers = (row = {}) => {
-    const response = { ...row };
-    const studentIdRaw = row.id ?? row.student_id;
-    const studentId = parsePositiveInteger(studentIdRaw) ?? studentIdRaw;
-    const facultyNumber = getResolvedFacultyNumberForResponse(row);
+const emailResolveNullCountsByEndpoint = new Map();
 
-    if (studentId !== undefined && studentId !== null && studentId !== "") {
-        response.id = studentId;
-        response.student_id = studentId;
-    }
+const withStudentResponseIdentifiers = (row = {}, { endpoint = "unknown" } = {}) => {
+    const response = serializeStudent(row);
+    const sourceEmail = row.email ?? row.email_encrypted;
 
-    if (facultyNumber) {
-        response.faculty_number = facultyNumber;
-        response.facultyNumber = facultyNumber;
+    if (typeof sourceEmail === "string" && sourceEmail.trim() && response.email === null) {
+        const currentCount = emailResolveNullCountsByEndpoint.get(endpoint) || 0;
+        const nextCount = currentCount + 1;
+        emailResolveNullCountsByEndpoint.set(endpoint, nextCount);
+        emitLog("warn", "EMAIL_RESOLVE_NULL", {
+            endpoint,
+            count: nextCount,
+            student_id: response.student_id ?? null,
+        });
     }
 
     return response;
@@ -1347,10 +1348,10 @@ app.post("/studentLogin", async (req, res) => {
 
         await updateAuthFieldsById("students", studentRow.id, updates);
 
-        const student = inflateStudent({
+        const student = withStudentResponseIdentifiers({
             ...studentRow,
             ...updates,
-        });
+        }, { endpoint: "POST /studentLogin" });
 
         return res.send({
             message: "Student login successful",
@@ -1493,8 +1494,9 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
         const student = withStudentResponseIdentifiers({
             ...result.rows[0],
             email: normalizedEmail,
+            email_encrypted: result.rows[0].email,
             faculty_number: normalizedFacultyNumber,
-        });
+        }, { endpoint: "POST /registration" });
         return res.send({ message: "User registration successful", student, registrationSuccess: true });
     } catch (error) {
         const mapped = mapRegistrationUniqueViolation(error);
@@ -1580,7 +1582,7 @@ app.get("/students", async (req, res) => {
         const sql = `SELECT * FROM students ${whereSql} ORDER BY id DESC`;
 
         const result = await pool.query(sql, params);
-        const students = result.rows.map((row) => withStudentResponseIdentifiers(inflateStudent(row)));
+        const students = result.rows.map((row) => withStudentResponseIdentifiers(row, { endpoint: "GET /students" }));
         return res.send({ students });
     } catch (error) {
         console.error("❌ Database error fetching students:", error);
@@ -1851,7 +1853,7 @@ app.get("/class_students", async (req, res) => {
             [classId]
         );
 
-        const students = rows.map((row) => withStudentResponseIdentifiers(inflateStudent(row)));
+        const students = rows.map((row) => withStudentResponseIdentifiers(row, { endpoint: "GET /class_students" }));
         return res.send({
             message: "Class students fetched",
             students
