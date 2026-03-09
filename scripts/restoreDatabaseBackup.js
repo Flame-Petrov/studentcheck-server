@@ -178,7 +178,6 @@ const loadPayloadFromBackupFile = (backupFilePath) => {
 
 const run = async () => {
     const backupFilePath = await resolveBackupFilePath();
-    console.log(`[RESTORE] Using backup file: ${backupFilePath}`);
     const payload = loadPayloadFromBackupFile(backupFilePath);
 
     const headers = BACKUP_API_KEY ? { "x-backup-key": BACKUP_API_KEY } : {};
@@ -188,7 +187,6 @@ const run = async () => {
 
     for (const baseUrl of CANDIDATE_BASE_URLS) {
         const importUrl = new URL("/backup/import", baseUrl).toString();
-        console.log(`[RESTORE] Trying ${importUrl}`);
         try {
             responsePayload = await requestJson({
                 method: "POST",
@@ -201,7 +199,6 @@ const run = async () => {
         } catch (error) {
             const reason = formatError(error);
             failures.push({ baseUrl, reason });
-            console.log(`[RESTORE] Attempt failed for ${baseUrl}: ${reason}`);
         }
     }
 
@@ -210,13 +207,7 @@ const run = async () => {
         throw new Error(`All restore endpoints failed. ${summary}`);
     }
 
-    console.log(`[RESTORE] SUCCESS using ${successfulBaseUrl}`);
-    console.log(
-        `[RESTORE] Tables processed: ${responsePayload.tablesProcessed || 0}, cleared: ${responsePayload.clearedTables || 0}, inserted rows: ${responsePayload.insertedRows || 0}`
-    );
-    console.log(`[RESTORE] Created tables: ${(responsePayload.createdTables || []).join(", ") || "none"}`);
     const addedColumns = Array.isArray(responsePayload.addedColumns) ? responsePayload.addedColumns.length : 0;
-    console.log(`[RESTORE] Added columns: ${addedColumns}`);
 };
 
 run().catch((error) => {

@@ -175,7 +175,6 @@ const run = async () => {
 
     for (const baseUrl of CANDIDATE_BASE_URLS) {
         const encryptUrl = new URL("/backup/encrypt", baseUrl).toString();
-        console.log(`[ENCRYPT] Trying ${encryptUrl}`);
         try {
             encryptedPayload = await requestJson({
                 method: "POST",
@@ -188,7 +187,6 @@ const run = async () => {
         } catch (error) {
             const reason = formatError(error);
             failures.push({ baseUrl, reason });
-            console.log(`[ENCRYPT] Attempt failed for ${baseUrl}: ${reason}`);
         }
     }
 
@@ -209,11 +207,6 @@ const run = async () => {
     await fs.mkdir(outputDir, { recursive: true });
     await fs.writeFile(outputFile, createEncryptedFileContents(outputPayload), "utf8");
 
-    console.log("[ENCRYPT] SUCCESS: backup data encrypted.");
-    console.log(`[ENCRYPT] Source file: ${backupFilePath}`);
-    console.log(`[ENCRYPT] Used server: ${successfulBaseUrl}`);
-    console.log(`[ENCRYPT] Encrypted output: ${outputFile}`);
-    console.log(`[ENCRYPT] Key reference: ${outputPayload.keyReference || "unknown"}`);
 };
 
 run().catch((error) => {

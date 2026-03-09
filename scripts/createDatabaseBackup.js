@@ -155,7 +155,6 @@ const run = async () => {
 
     for (const baseUrl of CANDIDATE_BASE_URLS) {
         const exportUrl = new URL("/backup/export", baseUrl).toString();
-        console.log(`[BACKUP] Trying ${exportUrl}`);
         try {
             payload = await requestJson(exportUrl, headers);
             successfulBaseUrl = baseUrl;
@@ -163,7 +162,6 @@ const run = async () => {
         } catch (error) {
             const reason = formatError(error);
             failures.push({ baseUrl, reason });
-            console.log(`[BACKUP] Attempt failed for ${baseUrl}: ${reason}`);
         }
     }
 
@@ -172,7 +170,6 @@ const run = async () => {
         throw new Error(`All backup endpoints failed. ${summary}`);
     }
 
-    console.log(`[BACKUP] Using base URL: ${successfulBaseUrl}`);
 
     const snapshot = {
         meta: {
@@ -207,10 +204,6 @@ const run = async () => {
         );
     }
 
-    console.log("[BACKUP] SUCCESS: database backup file has been saved.");
-    console.log(`[BACKUP] Backup saved to ${outputFile}`);
-    console.log(`[BACKUP] Per-table backups saved to ${perTableDir}`);
-    console.log(`[BACKUP] Tables included (${tableNames.length}): ${tableNames.join(", ")}`);
 };
 
 run().catch((error) => {

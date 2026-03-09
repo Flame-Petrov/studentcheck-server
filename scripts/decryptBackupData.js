@@ -222,7 +222,6 @@ const run = async () => {
 
     for (const baseUrl of CANDIDATE_BASE_URLS) {
         const decryptUrl = new URL("/backup/decrypt", baseUrl).toString();
-        console.log(`[DECRYPT] Trying ${decryptUrl}`);
         try {
             decryptedPayload = await requestJson({
                 method: "POST",
@@ -235,7 +234,6 @@ const run = async () => {
         } catch (error) {
             const reason = formatError(error);
             failures.push({ baseUrl, reason });
-            console.log(`[DECRYPT] Attempt failed for ${baseUrl}: ${reason}`);
         }
     }
 
@@ -272,11 +270,6 @@ const run = async () => {
     await fs.mkdir(outputDir, { recursive: true });
     await fs.writeFile(outputFile, createDecryptedFileContents(outputPayload), "utf8");
 
-    console.log("[DECRYPT] SUCCESS: encrypted backup data decrypted.");
-    console.log(`[DECRYPT] Source file: ${encryptedFilePath}`);
-    console.log(`[DECRYPT] Used server: ${successfulBaseUrl}`);
-    console.log(`[DECRYPT] Decrypted output: ${outputFile}`);
-    console.log(`[DECRYPT] Key reference: ${outputPayload.meta.keyReference}`);
 };
 
 run().catch((error) => {

@@ -118,7 +118,6 @@ const run = async () => {
 
     for (const baseUrl of CANDIDATE_BASE_URLS) {
         const dropUrl = new URL("/backup/drop-encryption-columns", baseUrl).toString();
-        console.log(`[DROP-COLUMNS] Trying ${dropUrl}`);
         try {
             responsePayload = await requestJson({
                 method: "POST",
@@ -131,7 +130,6 @@ const run = async () => {
         } catch (error) {
             const reason = formatError(error);
             failures.push({ baseUrl, reason });
-            console.log(`[DROP-COLUMNS] Attempt failed for ${baseUrl}: ${reason}`);
         }
     }
 
@@ -143,13 +141,8 @@ const run = async () => {
     const removedColumns = Array.isArray(responsePayload.removedColumns) ? responsePayload.removedColumns : [];
     const removedIndexes = Array.isArray(responsePayload.removedIndexes) ? responsePayload.removedIndexes : [];
 
-    console.log(`[DROP-COLUMNS] SUCCESS using ${successfulBaseUrl}`);
-    console.log(`[DROP-COLUMNS] Removed columns count: ${removedColumns.length}`);
     if (removedColumns.length > 0) {
-        console.log(`[DROP-COLUMNS] Removed columns: ${removedColumns.map((x) => `${x.table}.${x.column}`).join(", ")}`);
     }
-    console.log(`[DROP-COLUMNS] Dropped indexes: ${removedIndexes.join(", ") || "none"}`);
-    console.log("[DROP-COLUMNS] WARNING: login/query paths that rely on *_hash columns will fail until code/migration is adjusted.");
 };
 
 run().catch((error) => {

@@ -55,10 +55,27 @@ if (!JWT_SECRET) {
 const app = express();
 
 // ----------------- Structured Logging Helpers -----------------
-const rawLog = console.log.bind(console);
+const rawInfo = console.info.bind(console);
+const rawWarn = console.warn.bind(console);
 const rawError = console.error.bind(console);
 
-const logDivider = () => rawLog("============================================================");
+const LOG_MAX_CHARS = Number.parseInt(process.env.LOG_MAX_CHARS || "8000", 10);
+const LOG_MAX_ARRAY_ITEMS = Number.parseInt(process.env.LOG_MAX_ARRAY_ITEMS || "40", 10);
+const LOG_MAX_OBJECT_KEYS = Number.parseInt(process.env.LOG_MAX_OBJECT_KEYS || "60", 10);
+const SENSITIVE_LOG_KEYS = new Set([
+    "password",
+    "password_hash",
+    "passwordhash",
+    "token",
+    "access_token",
+    "accesstoken",
+    "refresh_token",
+    "refreshtoken",
+    "authorization",
+    "secret",
+    "api_key",
+    "apikey",
+]);
 
 const formatBgTime = (date = new Date()) => {
     const formatter = new Intl.DateTimeFormat("bg-BG", {
@@ -73,52 +90,237 @@ const formatBgTime = (date = new Date()) => {
     return formatter.format(date);
 };
 
-const scrubRequestBody = (body) => {
-    if (!body || typeof body !== "object") return body;
-    const cleaned = { ...body };
-    const sensitiveKeys = [
-        "password",
-        "password_hash",
-        "passwordHash",
-        "token",
-        "accessToken",
-        "refreshToken",
-        "email",
-        "facultyNumber",
-        "faculty_number",
-    ];
-    for (const key of sensitiveKeys) {
-        if (Object.prototype.hasOwnProperty.call(cleaned, key)) {
-            cleaned[key] = "[REDACTED]";
+const isSensitiveLogKey = (key) => {
+    const normalizedKey = String(key || "")
+        .replace(/[^a-zA-Z0-9]/g, "")
+        .toLowerCase();
+    return (
+        SENSITIVE_LOG_KEYS.has(normalizedKey) ||
+        normalizedKey.includes("password") ||
+        normalizedKey.includes("token") ||
+        normalizedKey.includes("secret") ||
+        normalizedKey.includes("apikey")
+    );
+};
+
+const sanitizeForLog = (value, seen = new WeakSet()) => {
+    if (value === null || value === undefined) return value;
+    if (typeof value === "number" || typeof value === "boolean") return value;
+    if (typeof value === "bigint") return value.toString();
+    if (typeof value === "string") {
+        if (value.length > LOG_MAX_CHARS) {
+            return `${value.slice(0, LOG_MAX_CHARS)}...[truncated ${value.length - LOG_MAX_CHARS} chars]`;
+        }
+        return value;
+    }
+    if (value instanceof Date) return value.toISOString();
+    if (Buffer.isBuffer(value)) return `[Buffer length=${value.length}]`;
+    if (value instanceof Error) {
+        return {
+            name: value.name,
+            message: value.message,
+            stack: value.stack,
+        };
+    }
+    if (typeof value === "function") {
+        return `[Function ${value.name || "anonymous"}]`;
+    }
+    if (Array.isArray(value)) {
+        const limited = value
+            .slice(0, LOG_MAX_ARRAY_ITEMS)
+            .map((item) => sanitizeForLog(item, seen));
+        if (value.length > LOG_MAX_ARRAY_ITEMS) {
+            limited.push(`[+${value.length - LOG_MAX_ARRAY_ITEMS} more items]`);
+        }
+        return limited;
+    }
+    if (typeof value === "object") {
+        if (seen.has(value)) return "[Circular]";
+        seen.add(value);
+        const result = {};
+        const entries = Object.entries(value).slice(0, LOG_MAX_OBJECT_KEYS);
+        for (const [key, childValue] of entries) {
+            if (isSensitiveLogKey(key)) {
+                result[key] = "[REDACTED]";
+                continue;
+            }
+            result[key] = sanitizeForLog(childValue, seen);
+        }
+        const totalKeys = Object.keys(value).length;
+        if (totalKeys > entries.length) {
+            result._truncatedKeys = totalKeys - entries.length;
+        }
+        return result;
+    }
+    return String(value);
+};
+
+const stringifyForLog = (payload) => {
+    try {
+        const serialized = JSON.stringify(sanitizeForLog(payload));
+        if (!serialized) return "{}";
+        if (serialized.length > LOG_MAX_CHARS) {
+            return `${serialized.slice(0, LOG_MAX_CHARS)}...[truncated ${serialized.length - LOG_MAX_CHARS} chars]`;
+        }
+        return serialized;
+    } catch (error) {
+        return JSON.stringify({ logSerializationError: error.message });
+    }
+};
+
+const emitLog = (level, eventName, payload = {}) => {
+    const line = `[${level.toUpperCase()} ${formatBgTime()}] ${eventName}`;
+    const serializedPayload = stringifyForLog(payload);
+    if (level === "error") {
+        rawError(line, serializedPayload);
+        return;
+    }
+    if (level === "warn") {
+        rawWarn(line, serializedPayload);
+        return;
+    }
+    rawInfo(line, serializedPayload);
+};
+
+const getActionContext = (req) => {
+    if (!req.actionContext) {
+        req.actionContext = {
+            requestId: crypto.randomUUID(),
+            actionName: `${req.method} ${req.path || req.originalUrl}`,
+            receivedAtMs: Date.now(),
+            startLogged: false,
+            endLogged: false,
+            flowStep: 0,
+            responseCaptured: false,
+            responseBody: null,
+        };
+    }
+    return req.actionContext;
+};
+
+const summarizeRequest = (req, options = {}) => {
+    const { includeBody = true } = options;
+    const summary = {
+        method: req.method,
+        path: req.originalUrl,
+        route: req.route?.path || null,
+        ip: req.ip,
+        params: req.params || {},
+        query: req.query || {},
+    };
+    if (includeBody) {
+        const body = req.body;
+        const hasBody = body !== undefined && body !== null && (
+            typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0
+        );
+        if (hasBody) {
+            summary.body = body;
         }
     }
-    return cleaned;
+    return summary;
+};
+
+const logActionFlow = (req, stage, data = {}) => {
+    const context = getActionContext(req);
+    context.flowStep += 1;
+    emitLog("info", "ACTION_FLOW", {
+        requestId: context.requestId,
+        action: context.actionName,
+        step: context.flowStep,
+        stage,
+        data,
+    });
 };
 
 const logRequestStart = (req, options = {}) => {
-    const { note, includeBody = true } = options;
-    logDivider();
-    rawLog(`[REQUEST] ${formatBgTime()} ${req.method} ${req.originalUrl}`);
-    if (note) {
-        rawLog(`[REQUEST] Note: ${note}`);
+    const { note, includeBody = true, actionName } = options;
+    const context = getActionContext(req);
+
+    if (actionName) {
+        context.actionName = actionName;
     }
-    const query = req.query || {};
-    if (Object.keys(query).length) {
-        rawLog("[REQUEST] Query:", query);
+
+    if (!context.startLogged) {
+        context.startLogged = true;
+        emitLog("info", "ACTION_START", {
+            requestId: context.requestId,
+            action: context.actionName,
+            note: note || null,
+            request: summarizeRequest(req, { includeBody }),
+        });
+        return;
     }
-    if (includeBody && req.body && Object.keys(req.body).length) {
-        rawLog("[REQUEST] Body:", scrubRequestBody(req.body));
-    }
-    logDivider();
+
+    logActionFlow(req, "request_update", {
+        note: note || null,
+        request: summarizeRequest(req, { includeBody }),
+    });
 };
 
-console.log = (...args) => rawLog(`[INFO ${formatBgTime()}]`, ...args);
+const logRequestEnd = (req, res) => {
+    const context = getActionContext(req);
+    if (context.endLogged) return;
+    context.endLogged = true;
+
+    emitLog("info", "ACTION_END", {
+        requestId: context.requestId,
+        action: context.actionName,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - context.receivedAtMs,
+        response: context.responseCaptured ? context.responseBody : "[no response body captured]",
+    });
+};
+
 console.error = (...args) => rawError(`[ERROR ${formatBgTime()}]`, ...args);
+console.warn = (...args) => rawWarn(`[WARN ${formatBgTime()}]`, ...args);
+console.info = (...args) => rawInfo(`[INFO ${formatBgTime()}]`, ...args);
+
+app.use((req, res, next) => {
+    const context = getActionContext(req);
+    res.setHeader("X-Request-Id", context.requestId);
+
+    const captureResponse = (body) => {
+        context.responseCaptured = true;
+        context.responseBody = body;
+    };
+
+    const originalSend = res.send.bind(res);
+    const originalJson = res.json.bind(res);
+    res.send = (body) => {
+        captureResponse(body);
+        return originalSend(body);
+    };
+    res.json = (body) => {
+        captureResponse(body);
+        return originalJson(body);
+    };
+
+    res.on("finish", () => {
+        if (!context.startLogged) {
+            logRequestStart(req, {
+                note: "auto-start",
+                includeBody: true,
+                actionName: `${req.method} ${req.route?.path || req.path || req.originalUrl}`,
+            });
+        }
+        logRequestEnd(req, res);
+    });
+
+    res.on("close", () => {
+        if (context.endLogged || res.writableEnded) return;
+        context.endLogged = true;
+        emitLog("warn", "ACTION_ABORTED", {
+            requestId: context.requestId,
+            action: context.actionName,
+            durationMs: Date.now() - context.receivedAtMs,
+            statusCode: res.statusCode,
+        });
+    });
+
+    next();
+});
 
 const addStudentsToClass = async (classId, students) => {
-    console.log("[CLASS STUDENTS] Begin assignment");
-    console.log("[CLASS STUDENTS] classId:", classId);
-    console.log("[CLASS STUDENTS] students payload:", students);
 
     const facultyNumbers = students
         .map(s => {
@@ -130,10 +332,8 @@ const addStudentsToClass = async (classId, students) => {
         .filter(Boolean)
         .map((value) => normalize(String(value)));
 
-    console.log("[CLASS STUDENTS] facultyNumbers:", facultyNumbers);
 
     if (facultyNumbers.length === 0) {
-        console.log("[CLASS STUDENTS] No valid faculty numbers provided");
         return { assignedCount: 0, facultyNumbers: [] };
     }
 
@@ -144,13 +344,10 @@ const addStudentsToClass = async (classId, students) => {
 
     const hashes = Array.from(new Set(Array.from(normalizedToHash.values())));
     const placeholders = hashes.map((_, i) => `$${i + 1}`).join(",");
-    console.log("[CLASS STUDENTS] placeholders:", placeholders);
 
     const selectSql = `SELECT id, faculty_number_hash FROM students WHERE faculty_number_hash IN (${placeholders})`;
-    console.log("[CLASS STUDENTS] selectSql:", selectSql);
 
     const result = await pool.query(selectSql, hashes);
-    console.log("[CLASS STUDENTS] students matched:", result.rows);
 
     const idMap = {};
     result.rows.forEach(row => {
@@ -159,16 +356,13 @@ const addStudentsToClass = async (classId, students) => {
 
     const insertSql = "INSERT INTO class_students (class_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
     const studentIds = Object.keys(idMap);
-    console.log("[CLASS STUDENTS] studentIds:", studentIds);
 
     let addedCount = 0;
     for (const id of studentIds) {
-        console.log("[CLASS STUDENTS] Assigning student_id:", id, "faculty_number:", idMap[id]);
         const insertRes = await pool.query(insertSql, [classId, id]);
         addedCount += insertRes.rowCount || 0;
     }
 
-    console.log("[CLASS STUDENTS] Assignment complete");
     return { assignedCount: addedCount, facultyNumbers };
 };
 
@@ -222,7 +416,6 @@ app.post("/api/billing/webhook", express.raw({ type: "application/json" }), crea
 
 // Lightweight uptime probe endpoint for frontend keep-alive pings.
 app.get("/healthz", (req, res) => {
-    console.log(`[HEALTHZ] ping from ${req.ip} at ${new Date().toISOString()}`);
     res.set("Cache-Control", "no-store");
     return res.status(200).send({
         ok: true,
@@ -293,7 +486,7 @@ const issueTeacherToken = ({ teacherId, emailHash, email }) => {
 };
 
 const logAuthEvent = (details) => {
-    console.log("[AUTH_EVENT]", details);
+    emitLog("info", "AUTH_EVENT", details);
 };
 
 const requireTeacherAuth = async (req, res, next) => {
@@ -427,11 +620,8 @@ const APPLY_ENCRYPTION_MIGRATION =
     String(process.env.APPLY_ENCRYPTION_MIGRATION || "").toLowerCase() === "true";
 const APPLY_ENCRYPTION_BACKFILL =
     String(process.env.APPLY_ENCRYPTION_BACKFILL || "").toLowerCase() === "true";
-console.log("[MIGRATION] APPLY_ENCRYPTION_MIGRATION =", APPLY_ENCRYPTION_MIGRATION);
-console.log("[MIGRATION] APPLY_ENCRYPTION_BACKFILL =", APPLY_ENCRYPTION_BACKFILL);
 
 const applyEncryptionMigration = async (client) => {
-    console.log("[MIGRATION] Applying encryption/hash columns migration (if needed)...");
     await client.query(`
         ALTER TABLE students
           ADD COLUMN IF NOT EXISTS email_encrypted TEXT,
@@ -463,7 +653,6 @@ const applyEncryptionMigration = async (client) => {
             ADD CONSTRAINT students_group_check
             CHECK ("group" ~ '^[0-9]+$' AND "group"::integer BETWEEN 30 AND 50);
     `);
-    console.log("[MIGRATION] Encryption/hash columns migration completed (or already in place).");
 };
 
 const getPlainTextFromPossiblyEncrypted = (value) => {
@@ -484,7 +673,6 @@ const getPlainTextFromPossiblyEncrypted = (value) => {
 };
 
 const backfillEncryptionForExistingData = async (client) => {
-    console.log("[BACKFILL] Starting backfill for students/teachers encrypted + hash fields (email + faculty)...");
 
     const { rows: studentRows } = await client.query(`
         SELECT
@@ -538,7 +726,6 @@ const backfillEncryptionForExistingData = async (client) => {
         );
         studentsUpdated += 1;
     }
-    console.log(`[BACKFILL] Students checked: ${studentRows.length}, updated: ${studentsUpdated}`);
 
     const { rows: teacherRows } = await client.query(`
         SELECT
@@ -579,9 +766,13 @@ const backfillEncryptionForExistingData = async (client) => {
         );
         teachersUpdated += 1;
     }
-    console.log(`[BACKFILL] Teachers checked: ${teacherRows.length}, updated: ${teachersUpdated}`);
 
-    console.log("[BACKFILL] Backfill completed.");
+    return {
+        studentRowsChecked: studentRows.length,
+        studentsUpdated,
+        teacherRowsChecked: teacherRows.length,
+        teachersUpdated,
+    };
 };
 
 const formatServerTime = (rawTime) => {
@@ -612,15 +803,14 @@ const verifyAndPrintTables = async (client) => {
     `);
 
     const existingTables = new Set(rows.map((row) => String(row.tablename)));
-    console.log(`[DB] Tables discovered in public schema: ${rows.length}`);
-
-    for (const row of rows) {
-        console.log(`[DB] Table ${row.tablename}: OK`);
-    }
+    emitLog("info", "DB_TABLES_DISCOVERED", {
+        count: rows.length,
+        tables: rows.map((row) => row.tablename),
+    });
 
     const missingTables = requiredTables.filter((tableName) => !existingTables.has(tableName));
     for (const tableName of missingTables) {
-        console.log(`[DB] Table ${tableName}: MISSING`);
+        emitLog("warn", "DB_TABLE_MISSING", { table: tableName });
     }
 };
 
@@ -631,11 +821,17 @@ const verifyAndPrintTables = async (client) => {
 (async () => {
   let client;
   try {
+    emitLog("info", "DB_STARTUP_BEGIN", {
+        applyEncryptionMigration: APPLY_ENCRYPTION_MIGRATION,
+        applyEncryptionBackfill: APPLY_ENCRYPTION_BACKFILL,
+    });
     client = await pool.connect();
-    console.log("[DB] Connected to PostgreSQL.");
+    emitLog("info", "DB_CONNECTED", {});
 
     const result = await client.query("SELECT NOW() AS server_time");
-    console.log("[DB] Server time:", formatServerTime(result.rows[0]?.server_time));
+        emitLog("info", "DB_SERVER_TIME", {
+            serverTime: formatServerTime(result.rows[0]?.server_time),
+        });
         // --- Ensure required tables exist (idempotent) ---
         await client.query(`
             CREATE TABLE IF NOT EXISTS classes (
@@ -652,17 +848,23 @@ const verifyAndPrintTables = async (client) => {
             );
         `);
         await db.ensureBillingTables();
+        emitLog("info", "DB_BILLING_TABLES_READY", {});
         await verifyAndPrintTables(client);
         if (APPLY_ENCRYPTION_MIGRATION) {
+            emitLog("info", "DB_ENCRYPTION_MIGRATION_START", {});
             await applyEncryptionMigration(client);
+            emitLog("info", "DB_ENCRYPTION_MIGRATION_END", {});
         } else {
-            console.log("[MIGRATION] APPLY_ENCRYPTION_MIGRATION=false, skipping encryption/hash migration.");
+            emitLog("info", "DB_ENCRYPTION_MIGRATION_SKIPPED", {});
         }
         if (APPLY_ENCRYPTION_BACKFILL) {
-            await backfillEncryptionForExistingData(client);
+            emitLog("info", "DB_ENCRYPTION_BACKFILL_START", {});
+            const backfillSummary = await backfillEncryptionForExistingData(client);
+            emitLog("info", "DB_ENCRYPTION_BACKFILL_END", backfillSummary);
         } else {
-            console.log("[BACKFILL] APPLY_ENCRYPTION_BACKFILL=false, skipping encryption/hash backfill.");
+            emitLog("info", "DB_ENCRYPTION_BACKFILL_SKIPPED", {});
         }
+        emitLog("info", "DB_STARTUP_END", {});
   } catch (err) {
     console.error("[DB] Startup initialization error:", err);
   } finally {
@@ -749,7 +951,6 @@ app.post("/teacherLogin", async (req, res) => {
             });
         }
 
-        console.log("[AUTH] Checking teacher credentials");
 
         const emailNorm = normalize(email);
         const emailHash = hashForLookup(emailNorm);
@@ -889,7 +1090,6 @@ app.post("/studentLogin", async (req, res) => {
             });
         }
 
-        console.log("[AUTH] Checking student credentials");
 
         const facultyNorm = normalize(facultyNumber);
         const facultyHash = hashForLookup(facultyNorm);
@@ -1283,16 +1483,11 @@ app.post("/classes", requireTeacherAuth, async (req, res) => {
     const { name, students } = req.body || {};
 
     if (!name) {
-        console.log("[CLASS CREATE] Validation failed: name is missing");
         return res.status(400).send({ error: "Class name is required" });
     }
     try {
-        console.log("[CLASS CREATE] Step 1: Resolve teacher from auth token");
         const teacherId = req.authTeacherId;
-        console.log("[CLASS CREATE] Teacher resolved -> id:", teacherId);
 
-        console.log("[CLASS CREATE] Step 2: Insert class");
-        console.log("[CLASS CREATE] Insert payload:", { teacher_id: teacherId, name });
 
         const insertResult = await pool.query(
             "INSERT INTO classes (teacher_id, name) VALUES ($1, $2) RETURNING id, teacher_id, name",
@@ -1301,17 +1496,11 @@ app.post("/classes", requireTeacherAuth, async (req, res) => {
 
         const created = insertResult.rows[0];
 
-        console.log("[CLASS CREATE] Insert result rows:", insertResult.rows);
-        console.log("[CLASS CREATE] Created class:", created);
         if (Array.isArray(students) && students.length > 0) {
-            console.log("[CLASS CREATE] Step 3: Assigning students to class");
             const assignmentResult = await addStudentsToClass(created.id, students);
-            console.log("[CLASS CREATE] Assignment result:", assignmentResult);
         } else {
-            console.log("[CLASS CREATE] Step 3: No students provided, skipping assignment");
         }
 
-        console.log("[CLASS CREATE] Step 4: Responding with created class");
         res.status(201).send({ message: "Class created", class: created });
 
     } catch (error) {
@@ -1364,7 +1553,6 @@ app.get("/classes", async (req, res) => {
                 return res.status(404).send({ error: "Teacher not found" });
             }
             const teacherId = t.rows[0].id;
-            console.log("Fetching classes for teacher ID:", teacherId);
 
             const classes = await pool.query(
                 `
@@ -1379,7 +1567,6 @@ app.get("/classes", async (req, res) => {
                 `,
                 [teacherId]
             );
-            console.log("Classes fetched:", classes.rows);
             
             return res.send({ message: "Classes fetched", classes: classes.rows });
         } else {
@@ -1523,22 +1710,18 @@ app.post("/class_students", requireTeacherAuth, async (req, res) => {
 app.get("/class_students", async (req, res) => {
     logRequestStart(req);
     var classId = req.query.class_id;
-    console.log("classId:", classId);
     if (!classId) {
         return res.status(400).send({ error: "class_id query parameter is required" });
     }
     var result  = await pool.query("SELECT * FROM class_students WHERE class_id = $1", [classId]);
-    console.log('Query result:', result.rows);
 
     // get student details for each student_id
     var studentIds = [];
     result.rows.forEach(row => {
         var studentId = row.student_id;
-        console.log("Student ID in class:", studentId);
         studentIds.push(studentId);
     });
 
-    console.log("Student IDs in class:", studentIds);
 
     // Fetch details for these students
     let studentsDetails = [];
@@ -1549,7 +1732,6 @@ app.get("/class_students", async (req, res) => {
         studentsDetails = detailsRes.rows;
     }
 
-    console.log("Students details fetched:", studentsDetails);
 
     return res.send({
         message: "Class students fetched",
@@ -1565,7 +1747,6 @@ app.get("/get_student_classes", async (req, res) => {
     logRequestStart(req);
 
     const rawStudentId = req.query.student_id;
-    console.log("studentId (raw):", rawStudentId);
 
     if (!rawStudentId || rawStudentId === "undefined" || rawStudentId === "null") {
         return res.status(400).send({ error: "student_id query parameter is required" });
@@ -1579,7 +1760,6 @@ app.get("/get_student_classes", async (req, res) => {
     const sql = `SELECT * FROM class_students WHERE student_id = $1`;
     const result  = await pool.query(sql, [studentId]);
 
-    console.log('Query result:', result.rows);
 
 
 
@@ -1607,7 +1787,6 @@ app.get("/get_student_classes", async (req, res) => {
 
 
 
-    console.log("Class names:", classNames);
 
     return res.send({
         message: "Student classes fetched",
@@ -1624,12 +1803,10 @@ app.get("/get_class_id_by_name", async (req, res) => {
     logRequestStart(req);
 
     var className = req.query.class_name;
-    console.log("className:", className);
 
     const sql = `SELECT id FROM classes WHERE name = $1`;
     const result  = await pool.query(sql, [className]);
 
-    console.log('Query result:', result.rows);
 
     if (result.rows.length === 0) {
         return res.status(404).send({ error: "Class not found" });
@@ -1637,7 +1814,6 @@ app.get("/get_class_id_by_name", async (req, res) => {
 
     const class_id = result.rows[0].id;
 
-    console.log("Class ID:", class_id);
 
     return res.send({
         message: "Class ID fetched",
@@ -1654,14 +1830,8 @@ app.post("/attendance", async (req, res) => {
     
     const { class_id, student_ids, student_id, faculty_number } = req.body || {};
 
-    console.log("[ATTENDANCE] Body:", req.body);
-    console.log("[ATTENDANCE] class_id:", class_id);
-    console.log("[ATTENDANCE] student_ids:", student_ids);
-    console.log("[ATTENDANCE] student_id:", student_id);
-    console.log("[ATTENDANCE] faculty_number:", faculty_number);
 
     if (!class_id || (!student_ids && !student_id && !faculty_number)) {
-        console.log("[ATTENDANCE] Validation failed: missing required fields");
         return res.status(400).send({ error: "class_id and student_id or faculty_number are required" });
     }
 
@@ -1672,9 +1842,7 @@ app.post("/attendance", async (req, res) => {
         }
 
         // Verify class exists
-        console.log("[ATTENDANCE] Checking class existence");
         const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classIdNum]);
-        console.log("[ATTENDANCE] classCheck.rows:", classCheck.rows);
         if (classCheck.rows.length === 0) {
             return res.status(404).send({ error: "Class not found" });
         }
@@ -1689,7 +1857,6 @@ app.post("/attendance", async (req, res) => {
 
         // Branch 1: array of student IDs
         if (Array.isArray(student_ids)) {
-            console.log("[ATTENDANCE] Branch: student_ids array");
             const studentIdsInt = student_ids
                 .map(value => Number(value))
                 .filter(Number.isFinite);
@@ -1701,19 +1868,15 @@ app.post("/attendance", async (req, res) => {
             }
 
             const results = [];
-            console.log("[ATTENDANCE] Processing attendance for IDs:", uniqueIds);
             for (const sid of uniqueIds) {
-                console.log(`[ATTENDANCE] Recording attendance class_id=${classIdNum}, student_id=${sid}`);
                 const { rows } = await pool.query(upsertSql, [classIdNum, sid]);
                 results.push(rows[0]);
             }
 
-            console.log("[ATTENDANCE] Results:", results);
             return res.status(200).send({ success: true, attendance: results });
         }
 
         // Branch 2: single student_id or faculty_number
-        console.log("[ATTENDANCE] Branch: single student");
         let resolvedStudentId = null;
 
         if (student_id !== undefined && student_id !== null) {
@@ -1721,37 +1884,29 @@ app.post("/attendance", async (req, res) => {
             if (!Number.isFinite(sid) || sid <= 0) {
                 return res.status(400).send({ error: "student_id must be a valid number" });
             }
-            console.log("[ATTENDANCE] Looking up student by id:", sid);
             const studentCheck = await pool.query("SELECT id FROM students WHERE id = $1", [sid]);
-            console.log("[ATTENDANCE] studentCheck.rows:", studentCheck.rows);
             if (studentCheck.rows.length === 0) {
                 return res.status(404).send({ error: "Student not found" });
             }
             resolvedStudentId = sid;
-            console.log("[ATTENDANCE] Resolved student_id:", resolvedStudentId);
         } else if (faculty_number) {
-            console.log("[ATTENDANCE] Looking up student by faculty_number:", faculty_number);
             const facNorm = normalize(faculty_number);
             const facHash = hashForLookup(facNorm);
             const studentCheck = await pool.query(
                 "SELECT id FROM students WHERE faculty_number_hash = $1",
                 [facHash]
             );
-            console.log("[ATTENDANCE] studentCheck.rows:", studentCheck.rows);
             if (studentCheck.rows.length === 0) {
                 return res.status(404).send({ error: "Student not found" });
             }
             resolvedStudentId = studentCheck.rows[0].id;
-            console.log("[ATTENDANCE] Resolved student_id from faculty_number:", resolvedStudentId);
         }
 
         if (!resolvedStudentId) {
             return res.status(400).send({ error: "student_id or faculty_number is required" });
         }
 
-        console.log("[ATTENDANCE] Upserting attendance with:", { classIdNum, resolvedStudentId });
         const { rows } = await pool.query(upsertSql, [classIdNum, resolvedStudentId]);
-        console.log("[ATTENDANCE] Result:", rows[0]);
         return res.status(200).send({ success: true, attendance: rows[0] });
     } catch (error) {
         console.error("❌ Database error recording attendance:", error);
@@ -1806,7 +1961,6 @@ app.get("/attendance/timestamps", async (req, res) => {
     logRequestStart(req);
 
     const classId = req.query.class_id;
-    console.log("[ATTENDANCE TIMESTAMPS] class_id:", classId);
 
     if (!classId) {
         return res.status(400).send({ error: "class_id query parameter is required" });
@@ -1850,9 +2004,6 @@ app.get("/attendance/history", async (req, res) => {
     logRequestStart(req);
 
     const { class_id, student_id, faculty_number } = req.query || {};
-    console.log("[ATTENDANCE HISTORY] class_id:", class_id);
-    console.log("[ATTENDANCE HISTORY] student_id:", student_id);
-    console.log("[ATTENDANCE HISTORY] faculty_number:", faculty_number);
 
     if (!class_id) {
         return res.status(400).send({ error: "class_id is required" });
@@ -1872,9 +2023,7 @@ app.get("/attendance/history", async (req, res) => {
                 return res.status(400).send({ error: "student_id must be a valid number" });
             }
             resolvedStudentId = sid;
-            console.log("[ATTENDANCE HISTORY] Using student_id:", resolvedStudentId);
         } else if (faculty_number) {
-            console.log("[ATTENDANCE HISTORY] Resolving student by faculty_number:", faculty_number);
             const facNorm = normalize(faculty_number);
             const facHash = hashForLookup(facNorm);
             const studentCheck = await pool.query(
@@ -1885,7 +2034,6 @@ app.get("/attendance/history", async (req, res) => {
                 return res.status(404).send({ error: "Student not found" });
             }
             resolvedStudentId = studentCheck.rows[0].id;
-            console.log("[ATTENDANCE HISTORY] Resolved student_id:", resolvedStudentId);
         } else {
             return res.status(400).send({ error: "student_id or faculty_number is required" });
         }
@@ -1918,7 +2066,6 @@ app.get("/attendance/summary", async (req, res) => {
     logRequestStart(req);
 
     const classId = req.query.class_id;
-    console.log("[ATTENDANCE SUMMARY] class_id:", classId);
 
     if (!classId) {
         return res.status(400).send({ error: "class_id is required" });
@@ -2012,10 +2159,8 @@ app.post("/class_students/remove", requireTeacherAuth, async (req, res) => {
             return res.status(404).send({ error: "Student not found with this faculty number" });
         }
         const student_id = resolvedStudentRow.id;
-        console.log("Student ID found:", student_id);
 
         const teacherId = req.authTeacherId;
-        console.log("Teacher ID found:", teacherId);
 
         // Step 2: Verify teacher owns the class
         const classResult = await pool.query(
@@ -2029,7 +2174,6 @@ app.post("/class_students/remove", requireTeacherAuth, async (req, res) => {
         if (!Number.isInteger(classTeacherId) || classTeacherId !== teacherId) {
             return res.status(403).send({ error: "You do not have permission to modify this class" });
         }
-        console.log("Teacher ownership verified for class:", classId);
 
         // Step 3: Verify student exists in class_students
         const studentInClassResult = await pool.query(
@@ -2039,14 +2183,12 @@ app.post("/class_students/remove", requireTeacherAuth, async (req, res) => {
         if (studentInClassResult.rows.length === 0) {
             return res.status(404).send({ error: "Student not found in this class" });
         }
-        console.log("Student found in class");
 
         // Step 4: Delete the record from class_students
         const deleteResult = await pool.query(
             "DELETE FROM class_students WHERE class_id = $1 AND student_id = $2 RETURNING id",
             [classId, student_id]
         );
-        console.log("Student removed from class:", deleteResult.rows[0]);
 
         res.status(200).send({ 
             message: "Student successfully removed from class",
@@ -2122,14 +2264,11 @@ app.post("/save_student_timestamps", async (req, res) => {
     var joined_at = dateTimeBG.format(joinedAtDate);
     var left_at = dateTimeBG.format(leftAtDate);
     
-    console.log("joined_at timestamp:", joined_at);
-    console.log("left_at timestamp:", left_at);
 
     const sql = `INSERT INTO attendance_timestamps (class_id, student_id, joined_at, left_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`;
 
     const result  = await pool.query(sql, [classId, studentId, joined_at, left_at]);
 
-    console.log("Student timestamps saved successfully for student:", studentId);
     
     return res.send({
         message: "Student timestamps saved"
@@ -2146,7 +2285,6 @@ app.get("/get_student_attendance_count", async (req, res) => {
     var studentId = req.query.student_id;
     var facultyNumber = req.query.faculty_number;
 
-    console.log("classId:", classId, "studentId:", studentId, "facultyNumber:", facultyNumber);
 
     if (!classId || (!studentId && !facultyNumber)) {
         return res.status(400).send({ error: "class_id and student_id or faculty_number are required" });
@@ -2161,14 +2299,12 @@ app.get("/get_student_attendance_count", async (req, res) => {
     const resolveFacultyNumber = facultyNumber || studentId;
 
     if (resolveFacultyNumber) {
-        console.log("[ATTENDANCE COUNT] Resolving student by faculty_number:", resolveFacultyNumber);
         const facNorm = normalize(resolveFacultyNumber);
         const facHash = hashForLookup(facNorm);
         const studentLookup = await pool.query(
             "SELECT id FROM students WHERE faculty_number_hash = $1",
             [facHash]
         );
-        console.log("[ATTENDANCE COUNT] studentLookup.rows:", studentLookup.rows);
         if (studentLookup.rows.length === 0) {
             return res.status(404).send({ error: "Student not found" });
         }
@@ -2176,7 +2312,6 @@ app.get("/get_student_attendance_count", async (req, res) => {
     } else {
         return res.status(400).send({ error: "student_id or faculty_number is required" });
     }
-    console.log("[ATTENDANCE COUNT] Using studentId:", studentIdNum);
 
     const sqlForStudentAttendance = `
         SELECT COALESCE((SELECT count FROM attendances WHERE class_id = $1 AND student_id = $2), 0) AS count
@@ -2189,15 +2324,11 @@ app.get("/get_student_attendance_count", async (req, res) => {
     const result  = await pool.query(sqlForStudentAttendance, [classIdNum, studentIdNum]);
     const result2 = await pool.query(sqlForTotalCompletedClasses, [classIdNum]);
 
-    console.log('Query result:', result.rows);
-    console.log('Query result 2:', result2.rows);
 
     const attendanceCount = Number(result.rows[0]?.count ?? 0);
     const totalCompletedClassesCount = Number(result2.rows[0]?.completed_classes_count ?? 0);
     
 
-    console.log("Attendance count:", attendanceCount);
-    console.log("Total completed classes count:", totalCompletedClassesCount);
     
     return res.send({
         message: "Student attendance count fetched",
@@ -2214,7 +2345,6 @@ app.post("/update_completed_classes_count", requireTeacherAuth, async (req, res)
     
     var classId = req.body.class_id;
 
-    console.log("classId:", classId);
 
     const sql = `UPDATE classes SET completed_classes_count = completed_classes_count + 1 WHERE id = $1 AND teacher_id = $2`;
     const result  = await pool.query(sql, [classId, req.authTeacherId]);
@@ -2222,7 +2352,6 @@ app.post("/update_completed_classes_count", requireTeacherAuth, async (req, res)
         return res.status(404).send({ error: "Class not found for this teacher" });
     }
 
-    console.log('Query result:', result.rows);
     
     return res.send({
         message: "Completed classes count updated"
@@ -2256,6 +2385,11 @@ app.post("/backup/drop-encryption-columns", dropEncryptionColumns);
 
 // ----------------- Database Backup Import Endpoint -----------------
 app.post("/backup/import", importBackup);
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
+app.listen(PORT, () => {
+    emitLog("info", "SERVER_LISTENING", {
+        port: Number(PORT),
+        nodeEnv: process.env.NODE_ENV || "development",
+    });
+});
 
