@@ -312,7 +312,6 @@ const loadTableFromFile = async ({ filePath, tableName, clearExisting }) => {
 
     for (const baseUrl of CANDIDATE_BASE_URLS) {
         const importUrl = new URL("/backup/import", baseUrl).toString();
-        console.log(`[LOAD-TABLE] Trying ${importUrl}`);
         try {
             responsePayload = await requestJson({
                 method: "POST",
@@ -325,7 +324,6 @@ const loadTableFromFile = async ({ filePath, tableName, clearExisting }) => {
         } catch (error) {
             const reason = formatError(error);
             failures.push({ baseUrl, reason });
-            console.log(`[LOAD-TABLE] Attempt failed for ${baseUrl}: ${reason}`);
         }
     }
 
@@ -352,12 +350,6 @@ const run = async () => {
         clearExisting,
     });
 
-    console.log(`[LOAD-TABLE] SUCCESS using ${result.baseUrl}`);
-    console.log(`[LOAD-TABLE] Table: ${result.tableName}`);
-    console.log(`[LOAD-TABLE] Source file: ${result.sourceFile}`);
-    console.log(`[LOAD-TABLE] Mode: ${clearExisting ? "replace (clearExisting=true)" : "append (clearExisting=false)"}`);
-    console.log(`[LOAD-TABLE] Inserted rows: ${result.responsePayload.insertedRows || 0}`);
-    console.log(`[LOAD-TABLE] Added columns: ${(result.responsePayload.addedColumns || []).length}`);
 };
 
 run().catch((error) => {

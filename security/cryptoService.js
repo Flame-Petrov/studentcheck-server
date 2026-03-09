@@ -82,7 +82,6 @@ const encryptRaw = (plain) => {
  */
 const decrypt = (payload) => {
     if (!payload) {
-        console.log("decrypt: null");
         return null;
     }
 

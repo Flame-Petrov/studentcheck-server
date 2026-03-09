@@ -7,7 +7,6 @@ const {
 const run = async (name, fn) => {
     try {
         await fn();
-        console.log(`PASS: ${name}`);
     } catch (err) {
         console.error(`FAIL: ${name}`);
         throw err;

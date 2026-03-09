@@ -14,7 +14,6 @@ const run = async () => {
         ) AS new_sequence_value
     `;
     const { rows } = await pool.query(sql);
-    console.log("students.id sequence synced:", rows[0]?.new_sequence_value);
 };
 
 run()

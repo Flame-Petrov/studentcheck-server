@@ -272,7 +272,6 @@ const run = async () => {
 
     for (const baseUrl of CANDIDATE_BASE_URLS) {
         const encryptUrl = new URL("/backup/encrypt-user-fields", baseUrl).toString();
-        console.log(`[ENCRYPT-USERS] Trying ${encryptUrl}`);
         try {
             responsePayload = await requestJson({
                 method: "POST",
@@ -285,7 +284,6 @@ const run = async () => {
         } catch (error) {
             const reason = formatError(error);
             failures.push({ baseUrl, reason });
-            console.log(`[ENCRYPT-USERS] Attempt failed for ${baseUrl}: ${reason}`);
         }
     }
 
@@ -322,14 +320,6 @@ const run = async () => {
     await fs.writeFile(outputFile, createOutputFileContents(outputPayload), "utf8");
 
     const summary = responsePayload.summary || {};
-    console.log("[ENCRYPT-USERS] SUCCESS: user email/password fields encrypted.");
-    console.log(`[ENCRYPT-USERS] Source file: ${inputBackupFilePath}`);
-    console.log(`[ENCRYPT-USERS] Used server: ${successfulBaseUrl}`);
-    console.log(`[ENCRYPT-USERS] Output file: ${outputFile}`);
-    console.log(`[ENCRYPT-USERS] Tables processed: ${summary.tablesProcessed || 0}`);
-    console.log(`[ENCRYPT-USERS] Email fields encrypted: ${summary.emailFieldsEncrypted || 0}`);
-    console.log(`[ENCRYPT-USERS] Password fields encrypted: ${summary.passwordFieldsEncrypted || 0}`);
-    console.log(`[ENCRYPT-USERS] Key reference: ${outputPayload.meta.keyReference}`);
 };
 
 run().catch((error) => {

@@ -18,7 +18,6 @@ const legacyHashVerifier = (value) => {
 const run = async (name, fn) => {
     try {
         await fn();
-        console.log(`PASS: ${name}`);
     } catch (error) {
         console.error(`FAIL: ${name}`);
         throw error;
@@ -108,7 +107,6 @@ const main = async () => {
         assert.notEqual(fields.password_hash, plainPassword);
     });
 
-    console.log("All password auth tests passed.");
 };
 
 main().catch((error) => {
