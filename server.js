@@ -4,6 +4,7 @@ const DATABASE_URL = "postgresql://postgres:Flame-Supabase01!@db.imnqwnpsuapkbbn
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const util = require("util");
 const { Pool } = require("pg"); // PostgreSQL client
 const Stripe = require("stripe");
 const { createDbAdapter } = require("./dbAdapter");
@@ -59,9 +60,12 @@ const rawInfo = console.info.bind(console);
 const rawWarn = console.warn.bind(console);
 const rawError = console.error.bind(console);
 
-const LOG_MAX_CHARS = Number.parseInt(process.env.LOG_MAX_CHARS || "8000", 10);
-const LOG_MAX_ARRAY_ITEMS = Number.parseInt(process.env.LOG_MAX_ARRAY_ITEMS || "40", 10);
-const LOG_MAX_OBJECT_KEYS = Number.parseInt(process.env.LOG_MAX_OBJECT_KEYS || "60", 10);
+const LOG_STRING_PREVIEW_CHARS = Number.parseInt(process.env.LOG_STRING_PREVIEW_CHARS || "220", 10);
+const LOG_PREVIEW_ARRAY_ITEMS = Number.parseInt(process.env.LOG_PREVIEW_ARRAY_ITEMS || "3", 10);
+const LOG_PREVIEW_OBJECT_KEYS = Number.parseInt(process.env.LOG_PREVIEW_OBJECT_KEYS || "12", 10);
+const LOG_MAX_DEPTH = Number.parseInt(process.env.LOG_MAX_DEPTH || "4", 10);
+const LOG_COMPACT_BREAK = Number.parseInt(process.env.LOG_COMPACT_BREAK || "180", 10);
+const OMIT_RESPONSE_BODY_FOR_STATUS = new Set([204, 304]);
 const SENSITIVE_LOG_KEYS = new Set([
     "password",
     "password_hash",
@@ -103,13 +107,27 @@ const isSensitiveLogKey = (key) => {
     );
 };
 
-const sanitizeForLog = (value, seen = new WeakSet()) => {
+const tryParseJsonString = (value) => {
+    if (typeof value !== "string") return { ok: false, value };
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+        return { ok: false, value };
+    }
+    try {
+        return { ok: true, value: JSON.parse(trimmed) };
+    } catch {
+        return { ok: false, value };
+    }
+};
+
+const summarizeForLog = (value, state = null) => {
+    const context = state || { depth: 0, seen: new WeakSet() };
     if (value === null || value === undefined) return value;
     if (typeof value === "number" || typeof value === "boolean") return value;
     if (typeof value === "bigint") return value.toString();
     if (typeof value === "string") {
-        if (value.length > LOG_MAX_CHARS) {
-            return `${value.slice(0, LOG_MAX_CHARS)}...[truncated ${value.length - LOG_MAX_CHARS} chars]`;
+        if (value.length > LOG_STRING_PREVIEW_CHARS) {
+            return `${value.slice(0, LOG_STRING_PREVIEW_CHARS)}...[+${value.length - LOG_STRING_PREVIEW_CHARS} chars]`;
         }
         return value;
     }
@@ -126,60 +144,102 @@ const sanitizeForLog = (value, seen = new WeakSet()) => {
         return `[Function ${value.name || "anonymous"}]`;
     }
     if (Array.isArray(value)) {
-        const limited = value
-            .slice(0, LOG_MAX_ARRAY_ITEMS)
-            .map((item) => sanitizeForLog(item, seen));
-        if (value.length > LOG_MAX_ARRAY_ITEMS) {
-            limited.push(`[+${value.length - LOG_MAX_ARRAY_ITEMS} more items]`);
-        }
-        return limited;
+        const sample = value
+            .slice(0, LOG_PREVIEW_ARRAY_ITEMS)
+            .map((item) => summarizeForLog(item, { depth: context.depth + 1, seen: context.seen }));
+        return {
+            count: value.length,
+            sample,
+        };
     }
     if (typeof value === "object") {
-        if (seen.has(value)) return "[Circular]";
-        seen.add(value);
+        if (context.seen.has(value)) return "[Circular]";
+        context.seen.add(value);
+        if (context.depth >= LOG_MAX_DEPTH) {
+            return `[Object keys=${Object.keys(value).length}]`;
+        }
         const result = {};
-        const entries = Object.entries(value).slice(0, LOG_MAX_OBJECT_KEYS);
+        const entries = Object.entries(value).slice(0, LOG_PREVIEW_OBJECT_KEYS);
         for (const [key, childValue] of entries) {
             if (isSensitiveLogKey(key)) {
                 result[key] = "[REDACTED]";
                 continue;
             }
-            result[key] = sanitizeForLog(childValue, seen);
+            result[key] = summarizeForLog(childValue, { depth: context.depth + 1, seen: context.seen });
         }
         const totalKeys = Object.keys(value).length;
         if (totalKeys > entries.length) {
-            result._truncatedKeys = totalKeys - entries.length;
+            result._moreKeys = totalKeys - entries.length;
         }
         return result;
     }
     return String(value);
 };
 
-const stringifyForLog = (payload) => {
-    try {
-        const serialized = JSON.stringify(sanitizeForLog(payload));
-        if (!serialized) return "{}";
-        if (serialized.length > LOG_MAX_CHARS) {
-            return `${serialized.slice(0, LOG_MAX_CHARS)}...[truncated ${serialized.length - LOG_MAX_CHARS} chars]`;
-        }
-        return serialized;
-    } catch (error) {
-        return JSON.stringify({ logSerializationError: error.message });
+const summarizeResponsePayload = (body) => {
+    if (body === undefined) return "[none]";
+    const parsed = tryParseJsonString(body);
+    if (parsed.ok) return summarizeForLog(parsed.value);
+    return summarizeForLog(body);
+};
+
+const formatFieldValue = (value) => {
+    return util.inspect(summarizeForLog(value), {
+        depth: LOG_MAX_DEPTH,
+        colors: false,
+        compact: true,
+        breakLength: LOG_COMPACT_BREAK,
+        maxArrayLength: LOG_PREVIEW_ARRAY_ITEMS + 2,
+        maxStringLength: LOG_STRING_PREVIEW_CHARS,
+    });
+};
+
+const formatPayloadFields = (payload = {}) => {
+    return Object.entries(payload)
+        .filter(([, value]) => value !== undefined && value !== null)
+        .map(([key, value]) => `${key}=${formatFieldValue(value)}`)
+        .join(" ");
+};
+
+const shortRequestId = (requestId) => {
+    const value = String(requestId || "");
+    return value ? value.slice(0, 8) : "n/a";
+};
+
+const summarizeRequest = (req, options = {}) => {
+    const { includeBody = true } = options;
+    const summary = {
+        ip: req.ip,
+        route: req.route?.path || null,
+        params: req.params || {},
+        query: req.query || {},
+    };
+
+    if (!includeBody) return summary;
+
+    const body = req.body;
+    const hasBody = body !== undefined && body !== null && (
+        typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0
+    );
+    if (hasBody) {
+        summary.body = body;
     }
+    return summary;
 };
 
 const emitLog = (level, eventName, payload = {}) => {
     const line = `[${level.toUpperCase()} ${formatBgTime()}] ${eventName}`;
-    const serializedPayload = stringifyForLog(payload);
+    const details = formatPayloadFields(payload);
+    const message = details ? `${line} ${details}` : line;
     if (level === "error") {
-        rawError(line, serializedPayload);
+        rawError(message);
         return;
     }
     if (level === "warn") {
-        rawWarn(line, serializedPayload);
+        rawWarn(message);
         return;
     }
-    rawInfo(line, serializedPayload);
+    rawInfo(message);
 };
 
 const getActionContext = (req) => {
@@ -198,33 +258,11 @@ const getActionContext = (req) => {
     return req.actionContext;
 };
 
-const summarizeRequest = (req, options = {}) => {
-    const { includeBody = true } = options;
-    const summary = {
-        method: req.method,
-        path: req.originalUrl,
-        route: req.route?.path || null,
-        ip: req.ip,
-        params: req.params || {},
-        query: req.query || {},
-    };
-    if (includeBody) {
-        const body = req.body;
-        const hasBody = body !== undefined && body !== null && (
-            typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0
-        );
-        if (hasBody) {
-            summary.body = body;
-        }
-    }
-    return summary;
-};
-
 const logActionFlow = (req, stage, data = {}) => {
     const context = getActionContext(req);
     context.flowStep += 1;
     emitLog("info", "ACTION_FLOW", {
-        requestId: context.requestId,
+        rid: shortRequestId(context.requestId),
         action: context.actionName,
         step: context.flowStep,
         stage,
@@ -242,11 +280,14 @@ const logRequestStart = (req, options = {}) => {
 
     if (!context.startLogged) {
         context.startLogged = true;
+        const request = summarizeRequest(req, { includeBody });
         emitLog("info", "ACTION_START", {
-            requestId: context.requestId,
+            rid: shortRequestId(context.requestId),
             action: context.actionName,
-            note: note || null,
-            request: summarizeRequest(req, { includeBody }),
+            method: req.method,
+            path: req.originalUrl,
+            note: note || undefined,
+            request,
         });
         return;
     }
@@ -262,12 +303,21 @@ const logRequestEnd = (req, res) => {
     if (context.endLogged) return;
     context.endLogged = true;
 
+    let responseSummary = "[no response body captured]";
+    if (context.responseCaptured) {
+        if (OMIT_RESPONSE_BODY_FOR_STATUS.has(res.statusCode)) {
+            responseSummary = `[omitted for status ${res.statusCode}]`;
+        } else {
+            responseSummary = summarizeResponsePayload(context.responseBody);
+        }
+    }
+
     emitLog("info", "ACTION_END", {
-        requestId: context.requestId,
+        rid: shortRequestId(context.requestId),
         action: context.actionName,
-        statusCode: res.statusCode,
-        durationMs: Date.now() - context.receivedAtMs,
-        response: context.responseCaptured ? context.responseBody : "[no response body captured]",
+        status: res.statusCode,
+        ms: Date.now() - context.receivedAtMs,
+        response: responseSummary,
     });
 };
 
@@ -310,10 +360,10 @@ app.use((req, res, next) => {
         if (context.endLogged || res.writableEnded) return;
         context.endLogged = true;
         emitLog("warn", "ACTION_ABORTED", {
-            requestId: context.requestId,
+            rid: shortRequestId(context.requestId),
             action: context.actionName,
-            durationMs: Date.now() - context.receivedAtMs,
-            statusCode: res.statusCode,
+            ms: Date.now() - context.receivedAtMs,
+            status: res.statusCode,
         });
     });
 
