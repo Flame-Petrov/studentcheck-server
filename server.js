@@ -59,6 +59,12 @@ const app = express();
 const rawInfo = console.info.bind(console);
 const rawWarn = console.warn.bind(console);
 const rawError = console.error.bind(console);
+const LOG_SEPARATOR = "======================";
+
+const writeLogWithSeparator = (writer, ...args) => {
+    writer(...args);
+    writer(LOG_SEPARATOR);
+};
 
 const LOG_STRING_PREVIEW_CHARS = Number.parseInt(process.env.LOG_STRING_PREVIEW_CHARS || "220", 10);
 const LOG_PREVIEW_ARRAY_ITEMS = Number.parseInt(process.env.LOG_PREVIEW_ARRAY_ITEMS || "3", 10);
@@ -232,14 +238,14 @@ const emitLog = (level, eventName, payload = {}) => {
     const details = formatPayloadFields(payload);
     const message = details ? `${line} ${details}` : line;
     if (level === "error") {
-        rawError(message);
+        writeLogWithSeparator(rawError, message);
         return;
     }
     if (level === "warn") {
-        rawWarn(message);
+        writeLogWithSeparator(rawWarn, message);
         return;
     }
-    rawInfo(message);
+    writeLogWithSeparator(rawInfo, message);
 };
 
 const getActionContext = (req) => {
@@ -321,9 +327,9 @@ const logRequestEnd = (req, res) => {
     });
 };
 
-console.error = (...args) => rawError(`[ERROR ${formatBgTime()}]`, ...args);
-console.warn = (...args) => rawWarn(`[WARN ${formatBgTime()}]`, ...args);
-console.info = (...args) => rawInfo(`[INFO ${formatBgTime()}]`, ...args);
+console.error = (...args) => writeLogWithSeparator(rawError, `[ERROR ${formatBgTime()}]`, ...args);
+console.warn = (...args) => writeLogWithSeparator(rawWarn, `[WARN ${formatBgTime()}]`, ...args);
+console.info = (...args) => writeLogWithSeparator(rawInfo, `[INFO ${formatBgTime()}]`, ...args);
 
 app.use((req, res, next) => {
     const context = getActionContext(req);
