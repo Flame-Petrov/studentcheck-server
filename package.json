@@ -13,7 +13,8 @@
     "db:backfill-mixed-student-emails": "node scripts/backfillMixedStudentEmails.js",
     "db:drop-encryption-columns": "node scripts/dropEncryptionColumns.js",
     "db:load-table": "node scripts/loadTableFromFile.js",
-    "db:sync-students-seq": "node scripts/syncStudentsIdSequence.js"
+    "db:sync-students-seq": "node scripts/syncStudentsIdSequence.js",
+    "db:reconcile-attendance": "node scripts/reconcileAttendanceSummary.js"
   },
   "dependencies": {
     "argon2": "^0.41.1",

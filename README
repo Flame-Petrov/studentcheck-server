@@ -13,3 +13,5 @@ psql {External Database URL}
 \d {table name} - show table details
 
 SELECT * FROM {table name}
+
+postgresql://USER:***REMOVED***@HOST/DATABASE
