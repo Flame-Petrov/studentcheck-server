@@ -13,3 +13,5 @@ psql {External Database URL}
 \d {table name} - show table details
 
 SELECT * FROM {table name}
+
+postgresql://flamepetrov:beNfkROTghKiKyCEVMoBkH18bvMZNBlR@dpg-d3vknvndiees73f2omc0-a.frankfurt-postgres.render.com/user_database_a6yu

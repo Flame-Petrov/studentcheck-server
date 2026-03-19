@@ -413,10 +413,20 @@ const addStudentsToClass = async (classId, students) => {
     const insertSql = "INSERT INTO class_students (class_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
     const studentIds = Object.keys(idMap);
 
+    const client = await pool.connect();
     let addedCount = 0;
-    for (const id of studentIds) {
-        const insertRes = await pool.query(insertSql, [classId, id]);
-        addedCount += insertRes.rowCount || 0;
+    try {
+        await client.query("BEGIN");
+        for (const id of studentIds) {
+            const insertRes = await client.query(insertSql, [classId, id]);
+            addedCount += insertRes.rowCount || 0;
+        }
+        await client.query("COMMIT");
+    } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+    } finally {
+        client.release();
     }
 
     return { assignedCount: addedCount, facultyNumbers };
@@ -711,6 +721,66 @@ const applyEncryptionMigration = async (client) => {
     `);
 };
 
+const applyAttendanceSchemaMigration = async (client) => {
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS attendance_timestamps (
+            id SERIAL PRIMARY KEY,
+            class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+            student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            joined_at TIMESTAMPTZ,
+            left_at TIMESTAMPTZ
+        );
+
+        ALTER TABLE attendances
+            ADD COLUMN IF NOT EXISTS count INTEGER;
+        UPDATE attendances
+        SET count = 0
+        WHERE count IS NULL;
+        ALTER TABLE attendances
+            ALTER COLUMN count SET DEFAULT 0;
+        ALTER TABLE attendances
+            ALTER COLUMN count SET NOT NULL;
+
+        ALTER TABLE attendance_timestamps
+            ADD COLUMN IF NOT EXISTS session_key TEXT,
+            ADD COLUMN IF NOT EXISTS status TEXT,
+            ADD COLUMN IF NOT EXISTS class_name TEXT,
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+
+        UPDATE attendance_timestamps
+        SET
+            created_at = COALESCE(created_at, NOW()),
+            updated_at = COALESCE(updated_at, NOW());
+
+        UPDATE attendance_timestamps
+        SET session_key = md5(
+            COALESCE(class_id::text, '') || ':' ||
+            COALESCE(student_id::text, '') || ':' ||
+            COALESCE(joined_at::text, left_at::text, '')
+        )
+        WHERE session_key IS NULL;
+
+        ALTER TABLE attendance_timestamps
+            ALTER COLUMN created_at SET DEFAULT NOW();
+        ALTER TABLE attendance_timestamps
+            ALTER COLUMN created_at SET NOT NULL;
+        ALTER TABLE attendance_timestamps
+            ALTER COLUMN updated_at SET DEFAULT NOW();
+        ALTER TABLE attendance_timestamps
+            ALTER COLUMN updated_at SET NOT NULL;
+        ALTER TABLE attendance_timestamps
+            ALTER COLUMN session_key SET NOT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_attendance_timestamps_class_student
+            ON attendance_timestamps (class_id, student_id);
+        CREATE INDEX IF NOT EXISTS idx_attendance_timestamps_class_student_session_key
+            ON attendance_timestamps (class_id, student_id, session_key);
+        CREATE INDEX IF NOT EXISTS idx_attendance_timestamps_class_joined_left
+            ON attendance_timestamps (class_id, joined_at, left_at);
+    `);
+};
+
 const getPlainTextFromPossiblyEncrypted = (value) => {
     const raw = String(value || "");
     if (!raw) return { plainText: "", wasEncrypted: false };
@@ -903,6 +973,8 @@ const verifyAndPrintTables = async (client) => {
                 UNIQUE(class_id, student_id)
             );
         `);
+        await applyAttendanceSchemaMigration(client);
+        emitLog("info", "DB_ATTENDANCE_SCHEMA_READY", {});
         await db.ensureBillingTables();
         emitLog("info", "DB_BILLING_TABLES_READY", {});
         await verifyAndPrintTables(client);
@@ -1028,6 +1100,182 @@ const withAttendanceStudentIdentifiers = (row = {}) => {
     }
 
     return response;
+};
+
+const ATTENDANCE_DERIVED_COUNT_FILTER_SQL = "(joined_at IS NOT NULL OR left_at IS NOT NULL)";
+const ATTENDANCE_POSITIVE_STATUSES = new Set(["attended", "present", "completed", "checked_in", "checked-in"]);
+
+const normalizeAttendanceStatus = (value) => {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    return trimmed.toLowerCase();
+};
+
+const isPositiveAttendanceStatus = (status) => {
+    const normalized = normalizeAttendanceStatus(status);
+    if (!normalized) return false;
+    return ATTENDANCE_POSITIVE_STATUSES.has(normalized);
+};
+
+const parseOptionalIsoTimestamp = (value) => {
+    if (value === undefined || value === null) {
+        return { ok: true, value: null };
+    }
+
+    const text = String(value).trim();
+    if (!text) {
+        return { ok: true, value: null };
+    }
+
+    const parsed = new Date(text);
+    if (Number.isNaN(parsed.getTime())) {
+        return { ok: false, value: null };
+    }
+
+    return { ok: true, value: parsed.toISOString() };
+};
+
+const buildAttendanceSessionKey = ({ classId, studentId, joinedAt, leftAt }) => {
+    const sessionWindowAnchor = joinedAt || leftAt || "";
+    const raw = `${classId}|${studentId}|${sessionWindowAnchor}`;
+    return crypto.createHash("sha256").update(raw).digest("hex");
+};
+
+const buildAttendanceStudentResolver = (client) => {
+    const studentByIdCache = new Map();
+    const studentByFacultyNormCache = new Map();
+    let fallbackFacultyCandidates = null;
+
+    const resolveById = async (value) => {
+        const studentId = parsePositiveInteger(value);
+        if (!studentId) return null;
+        if (studentByIdCache.has(studentId)) {
+            return studentByIdCache.get(studentId);
+        }
+
+        const { rows } = await client.query(
+            `
+            SELECT id, faculty_number, faculty_number_encrypted, faculty_number_hash
+            FROM students
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [studentId]
+        );
+        const row = rows[0] || null;
+        studentByIdCache.set(studentId, row);
+        return row;
+    };
+
+    const resolveByFacultyNumber = async (value) => {
+        if (value === undefined || value === null) return null;
+        const facultyNorm = normalize(String(value));
+        if (!facultyNorm) return null;
+
+        if (studentByFacultyNormCache.has(facultyNorm)) {
+            return studentByFacultyNormCache.get(facultyNorm);
+        }
+
+        const facultyHash = hashForLookup(facultyNorm);
+        const fastResult = await client.query(
+            `
+            SELECT id, faculty_number, faculty_number_encrypted, faculty_number_hash
+            FROM students
+            WHERE faculty_number_hash = $1
+            LIMIT 1
+            `,
+            [facultyHash]
+        );
+
+        let row = fastResult.rows[0] || null;
+        if (!row) {
+            if (!fallbackFacultyCandidates) {
+                const fallbackResult = await client.query(
+                    `
+                    SELECT id, faculty_number, faculty_number_encrypted, faculty_number_hash
+                    FROM students
+                    ORDER BY id ASC
+                    LIMIT 10000
+                    `
+                );
+                fallbackFacultyCandidates = fallbackResult.rows;
+            }
+
+            row = fallbackFacultyCandidates.find((candidate) => {
+                return identifierMatches({
+                    inputNormalized: facultyNorm,
+                    rowHash: candidate.faculty_number_hash,
+                    rowPlain: candidate.faculty_number,
+                    rowEncrypted: candidate.faculty_number_encrypted,
+                });
+            }) || null;
+        }
+
+        studentByFacultyNormCache.set(facultyNorm, row);
+        if (row?.id) {
+            studentByIdCache.set(Number(row.id), row);
+        }
+        return row;
+    };
+
+    return {
+        resolveById,
+        resolveByFacultyNumber,
+    };
+};
+
+const recomputeAttendanceSummaryForClass = async (client, classId) => {
+    const classIdNum = parsePositiveInteger(classId);
+    if (!classIdNum) {
+        throw new Error("Invalid class_id for summary recomputation");
+    }
+
+    await client.query(
+        `
+        WITH derived AS (
+            SELECT
+                class_id,
+                student_id,
+                COUNT(DISTINCT session_key)::INTEGER AS derived_count
+            FROM attendance_timestamps
+            WHERE class_id = $1
+              AND ${ATTENDANCE_DERIVED_COUNT_FILTER_SQL}
+            GROUP BY class_id, student_id
+        )
+        INSERT INTO attendances (class_id, student_id, count, timestamp)
+        SELECT
+            d.class_id,
+            d.student_id,
+            d.derived_count,
+            NOW()
+        FROM derived d
+        ON CONFLICT (class_id, student_id)
+        DO UPDATE SET
+            count = EXCLUDED.count,
+            timestamp = NOW()
+        `,
+        [classIdNum]
+    );
+
+    await client.query(
+        `
+        UPDATE attendances a
+        SET
+            count = 0,
+            timestamp = NOW()
+        WHERE a.class_id = $1
+          AND NOT EXISTS (
+              SELECT 1
+              FROM attendance_timestamps at
+              WHERE at.class_id = a.class_id
+                AND at.student_id = a.student_id
+                AND ${ATTENDANCE_DERIVED_COUNT_FILTER_SQL}
+          )
+          AND COALESCE(a.count, 0) <> 0
+        `,
+        [classIdNum]
+    );
 };
 
 const updateAuthFieldsById = async (tableName, id, updates) => {
@@ -1628,9 +1876,9 @@ app.post("/classes", requireTeacherAuth, async (req, res) => {
 // (Optional helper) List classes for a teacher by email query param: /classes?teacherEmail=...
 app.get("/classes", async (req, res) => {
     logRequestStart(req);
-    const { teacherEmail, class_id, classId } = req.query;
+    const { teacherEmail, class_id } = req.query;
     try {
-        const requestedClassIdRaw = class_id ?? classId;
+        const requestedClassIdRaw = class_id;
         if (requestedClassIdRaw !== undefined) {
             const requestedClassId = Number.parseInt(String(requestedClassIdRaw), 10);
             if (!Number.isInteger(requestedClassId) || requestedClassId <= 0) {
@@ -2039,6 +2287,283 @@ app.post("/attendance", async (req, res) => {
     }
 });
 
+// ----------------- Transactional Attendance Finish Endpoint -----------------
+// Accepts body:
+// {
+//   class_id: number,
+//   class_name?: string,
+//   records: [{ student_id?, faculty_number?, status?, joined_at?, left_at? }]
+// }
+app.post("/attendance/finish", async (req, res) => {
+    logRequestStart(req);
+
+    const { class_id, class_name, records } = req.body || {};
+    const classIdNum = parsePositiveInteger(class_id);
+
+    if (!classIdNum) {
+        return res.status(400).send({ error: "class_id must be a valid positive integer" });
+    }
+
+    if (!Array.isArray(records) || records.length === 0) {
+        return res.status(400).send({ error: "records must be a non-empty array" });
+    }
+
+    const classNameNormalized = typeof class_name === "string" ? class_name.trim() : null;
+    if (class_name !== undefined && class_name !== null && !classNameNormalized) {
+        return res.status(400).send({ error: "class_name must be a non-empty string when provided" });
+    }
+
+    const client = await pool.connect();
+    let transactionOpen = false;
+
+    try {
+        await client.query("BEGIN");
+        transactionOpen = true;
+
+        // Serialize writes for this class to keep idempotency deterministic across retries.
+        await client.query("SELECT pg_advisory_xact_lock($1::bigint)", [classIdNum]);
+
+        const classCheck = await client.query(
+            `
+            SELECT id, name
+            FROM classes
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [classIdNum]
+        );
+        if (!classCheck.rows.length) {
+            await client.query("ROLLBACK");
+            transactionOpen = false;
+            return res.status(404).send({ error: "Class not found" });
+        }
+
+        const persistedClassName = classNameNormalized || classCheck.rows[0].name || null;
+        const studentResolver = buildAttendanceStudentResolver(client);
+
+        const validationErrors = [];
+        const conflictErrors = [];
+        const candidateRecords = [];
+
+        for (let index = 0; index < records.length; index += 1) {
+            const record = records[index];
+            if (!record || typeof record !== "object" || Array.isArray(record)) {
+                validationErrors.push({
+                    index,
+                    field: "record",
+                    message: "Each records[] entry must be an object",
+                });
+                continue;
+            }
+
+            const rawStudentId = record.student_id ?? record.studentId;
+            const rawFacultyNumber = record.faculty_number ?? record.facultyNumber;
+            if (
+                (rawStudentId === undefined || rawStudentId === null || String(rawStudentId).trim() === "")
+                && (rawFacultyNumber === undefined || rawFacultyNumber === null || String(rawFacultyNumber).trim() === "")
+            ) {
+                validationErrors.push({
+                    index,
+                    field: "student_id|faculty_number",
+                    message: "student_id or faculty_number is required",
+                });
+                continue;
+            }
+
+            const resolvedById = await studentResolver.resolveById(rawStudentId);
+            const resolvedByFaculty = await studentResolver.resolveByFacultyNumber(rawFacultyNumber);
+            const resolvedStudent = resolvedById || resolvedByFaculty;
+
+            if (resolvedById && resolvedByFaculty && Number(resolvedById.id) !== Number(resolvedByFaculty.id)) {
+                conflictErrors.push({
+                    index,
+                    student_id: rawStudentId ?? null,
+                    faculty_number: rawFacultyNumber ?? null,
+                    message: "student_id and faculty_number resolve to different students",
+                });
+                continue;
+            }
+
+            if (!resolvedStudent) {
+                validationErrors.push({
+                    index,
+                    field: "student_id|faculty_number",
+                    message: "Unable to resolve student identity",
+                });
+                continue;
+            }
+
+            if (record.status !== undefined && record.status !== null && typeof record.status !== "string") {
+                validationErrors.push({
+                    index,
+                    field: "status",
+                    message: "status must be a string when provided",
+                });
+                continue;
+            }
+
+            const normalizedStatus = normalizeAttendanceStatus(record.status);
+
+            const joinedAtParsed = parseOptionalIsoTimestamp(record.joined_at ?? record.joinedAt);
+            if (!joinedAtParsed.ok) {
+                validationErrors.push({
+                    index,
+                    field: "joined_at",
+                    message: "joined_at must be a valid ISO timestamp or null",
+                });
+                continue;
+            }
+
+            const leftAtParsed = parseOptionalIsoTimestamp(record.left_at ?? record.leftAt);
+            if (!leftAtParsed.ok) {
+                validationErrors.push({
+                    index,
+                    field: "left_at",
+                    message: "left_at must be a valid ISO timestamp or null",
+                });
+                continue;
+            }
+
+            if (joinedAtParsed.value && leftAtParsed.value) {
+                const joinedAtMs = Date.parse(joinedAtParsed.value);
+                const leftAtMs = Date.parse(leftAtParsed.value);
+                if (Number.isFinite(joinedAtMs) && Number.isFinite(leftAtMs) && leftAtMs < joinedAtMs) {
+                    validationErrors.push({
+                        index,
+                        field: "left_at",
+                        message: "left_at must be after or equal to joined_at",
+                    });
+                    continue;
+                }
+            }
+
+            const hasTimeWindow = Boolean(joinedAtParsed.value || leftAtParsed.value);
+            if (!hasTimeWindow) {
+                if (isPositiveAttendanceStatus(normalizedStatus)) {
+                    validationErrors.push({
+                        index,
+                        field: "joined_at|left_at",
+                        message: "Positive attendance statuses require joined_at or left_at",
+                    });
+                }
+                continue;
+            }
+
+            const resolvedStudentId = Number(resolvedStudent.id);
+            candidateRecords.push({
+                studentId: resolvedStudentId,
+                status: normalizedStatus,
+                joinedAt: joinedAtParsed.value,
+                leftAt: leftAtParsed.value,
+                sessionKey: buildAttendanceSessionKey({
+                    classId: classIdNum,
+                    studentId: resolvedStudentId,
+                    joinedAt: joinedAtParsed.value,
+                    leftAt: leftAtParsed.value,
+                }),
+            });
+        }
+
+        if (conflictErrors.length > 0) {
+            await client.query("ROLLBACK");
+            transactionOpen = false;
+            return res.status(409).send({
+                error: "Conflicting student identifiers detected",
+                conflicts: conflictErrors,
+            });
+        }
+
+        if (validationErrors.length > 0) {
+            await client.query("ROLLBACK");
+            transactionOpen = false;
+            return res.status(400).send({
+                error: "Attendance finish payload validation failed",
+                details: validationErrors,
+            });
+        }
+
+        const uniqueRecordsBySessionKey = new Map();
+        for (const row of candidateRecords) {
+            uniqueRecordsBySessionKey.set(`${row.studentId}:${row.sessionKey}`, row);
+        }
+        const recordsToPersist = Array.from(uniqueRecordsBySessionKey.values());
+
+        let insertedCount = 0;
+        for (const row of recordsToPersist) {
+            const existing = await client.query(
+                `
+                SELECT id
+                FROM attendance_timestamps
+                WHERE class_id = $1
+                  AND student_id = $2
+                  AND session_key = $3
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [classIdNum, row.studentId, row.sessionKey]
+            );
+
+            if (existing.rows.length > 0) {
+                await client.query(
+                    `
+                    UPDATE attendance_timestamps
+                    SET
+                        joined_at = COALESCE($1, joined_at),
+                        left_at = COALESCE($2, left_at),
+                        status = COALESCE($3, status),
+                        class_name = COALESCE($4, class_name),
+                        updated_at = NOW()
+                    WHERE id = $5
+                    `,
+                    [row.joinedAt, row.leftAt, row.status, persistedClassName, existing.rows[0].id]
+                );
+            } else {
+                insertedCount += 1;
+                await client.query(
+                    `
+                    INSERT INTO attendance_timestamps (
+                        class_id,
+                        student_id,
+                        session_key,
+                        status,
+                        class_name,
+                        joined_at,
+                        left_at,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+                    `,
+                    [classIdNum, row.studentId, row.sessionKey, row.status, persistedClassName, row.joinedAt, row.leftAt]
+                );
+            }
+        }
+
+        await recomputeAttendanceSummaryForClass(client, classIdNum);
+
+        await client.query("COMMIT");
+        transactionOpen = false;
+
+        const statusCode = insertedCount > 0 ? 201 : 200;
+        return res.status(statusCode).send({
+            ok: true,
+            saved: recordsToPersist.length,
+        });
+    } catch (error) {
+        if (transactionOpen) {
+            try {
+                await client.query("ROLLBACK");
+            } catch (rollbackError) {
+                console.error("Failed rolling back /attendance/finish transaction:", rollbackError);
+            }
+        }
+        console.error("❌ Database error finishing attendance session:", error);
+        return res.status(500).send({ error: "Internal server error" });
+    } finally {
+        client.release();
+    }
+});
+
 // List attendance entries optionally filtered by classId: /attendance?classId=...
 app.get("/attendance", async (req, res) => {
     logRequestStart(req);
@@ -2249,8 +2774,8 @@ app.get("/attendance/summary", async (req, res) => {
 app.post("/class_students/remove", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
-    const classId = req.body.class_id ?? req.body.classId;
-    const facultyNumberRaw = req.body.faculty_number ?? req.body.facultyNumber;
+    const classId = req.body.class_id;
+    const facultyNumberRaw = req.body.faculty_number;
     const facultyNumber = facultyNumberRaw ? String(facultyNumberRaw).trim() : facultyNumberRaw;
 
     // Validate required fields
@@ -2361,55 +2886,139 @@ app.all("/heartbeat", (req, res) => {
 
 app.post("/save_student_timestamps", async (req, res) => {
     logRequestStart(req);
-    
-    var classId = req.body.class_id;
-    var studentFacultyNumber = req.body.faculty_number;
 
-    const facNorm = normalize(studentFacultyNumber);
-    const facHash = hashForLookup(facNorm);
+    const classIdNum = parsePositiveInteger(req.body.class_id);
+    const studentFacultyNumber = req.body.faculty_number;
+    const joinedAtParsed = parseOptionalIsoTimestamp(req.body.joined_at);
+    const leftAtParsed = parseOptionalIsoTimestamp(req.body.left_at);
 
-    const studentIdQueryResult = await pool.query(
-        "SELECT id FROM students WHERE faculty_number_hash = $1",
-        [facHash]
-    );
-
-    const studentId = Number(studentIdQueryResult.rows[0].id);
-
-    if(!studentId){
-        console.error("Error: Student not found with faculty number:", studentFacultyNumber);
-        return res.status(404).send({ error: "Student not found in database." });
+    if (!classIdNum) {
+        return res.status(400).send({ error: "class_id must be a valid positive integer" });
     }
-
-    var joined_at_raw = req.body.joined_at;
-    var left_at_raw = req.body.left_at;
-
-    if(joined_at_raw == null || left_at_raw == null){
-        console.error("This student has not attended the class: ", studentFacultyNumber);
+    if (!studentFacultyNumber || !String(studentFacultyNumber).trim()) {
+        return res.status(400).send({ error: "faculty_number is required" });
+    }
+    if (!joinedAtParsed.ok || !leftAtParsed.ok) {
+        return res.status(400).send({ error: "joined_at and left_at must be valid ISO timestamps" });
+    }
+    if (!joinedAtParsed.value && !leftAtParsed.value) {
         return res.status(400).send({ error: `${studentFacultyNumber} has not been marked as attended.` });
     }
 
-    // Format timestamps in Bulgarian timezone (Europe/Sofia)
-    const dateTimeBG = new Intl.DateTimeFormat('bg-BG', {
-        timeZone: 'Europe/Sofia',
-        year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', second: '2-digit'
-    });
+    if (joinedAtParsed.value && leftAtParsed.value) {
+        const joinedAtMs = Date.parse(joinedAtParsed.value);
+        const leftAtMs = Date.parse(leftAtParsed.value);
+        if (Number.isFinite(joinedAtMs) && Number.isFinite(leftAtMs) && leftAtMs < joinedAtMs) {
+            return res.status(400).send({ error: "left_at must be after or equal to joined_at" });
+        }
+    }
 
-    const joinedAtDate = new Date(joined_at_raw);
-    const leftAtDate = new Date(left_at_raw);
+    const client = await pool.connect();
+    let transactionOpen = false;
 
-    var joined_at = dateTimeBG.format(joinedAtDate);
-    var left_at = dateTimeBG.format(leftAtDate);
-    
+    try {
+        await client.query("BEGIN");
+        transactionOpen = true;
+        await client.query("SELECT pg_advisory_xact_lock($1::bigint)", [classIdNum]);
 
-    const sql = `INSERT INTO attendance_timestamps (class_id, student_id, joined_at, left_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`;
+        const classCheck = await client.query(
+            `
+            SELECT id, name
+            FROM classes
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [classIdNum]
+        );
+        if (!classCheck.rows.length) {
+            await client.query("ROLLBACK");
+            transactionOpen = false;
+            return res.status(404).send({ error: "Class not found" });
+        }
 
-    const result  = await pool.query(sql, [classId, studentId, joined_at, left_at]);
+        const studentResolver = buildAttendanceStudentResolver(client);
+        const studentRow = await studentResolver.resolveByFacultyNumber(studentFacultyNumber);
+        if (!studentRow?.id) {
+            await client.query("ROLLBACK");
+            transactionOpen = false;
+            return res.status(404).send({ error: "Student not found in database." });
+        }
+        const studentId = Number(studentRow.id);
 
-    
-    return res.send({
-        message: "Student timestamps saved"
-    });
+        const sessionKey = buildAttendanceSessionKey({
+            classId: classIdNum,
+            studentId,
+            joinedAt: joinedAtParsed.value,
+            leftAt: leftAtParsed.value,
+        });
+
+        const existing = await client.query(
+            `
+            SELECT id
+            FROM attendance_timestamps
+            WHERE class_id = $1
+              AND student_id = $2
+              AND session_key = $3
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [classIdNum, studentId, sessionKey]
+        );
+
+        if (existing.rows.length > 0) {
+            await client.query(
+                `
+                UPDATE attendance_timestamps
+                SET
+                    joined_at = COALESCE($1, joined_at),
+                    left_at = COALESCE($2, left_at),
+                    status = COALESCE(status, 'completed'),
+                    class_name = COALESCE(class_name, $3),
+                    updated_at = NOW()
+                WHERE id = $4
+                `,
+                [joinedAtParsed.value, leftAtParsed.value, classCheck.rows[0].name || null, existing.rows[0].id]
+            );
+        } else {
+            await client.query(
+                `
+                INSERT INTO attendance_timestamps (
+                    class_id,
+                    student_id,
+                    session_key,
+                    status,
+                    class_name,
+                    joined_at,
+                    left_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, 'completed', $4, $5, $6, NOW(), NOW())
+                `,
+                [classIdNum, studentId, sessionKey, classCheck.rows[0].name || null, joinedAtParsed.value, leftAtParsed.value]
+            );
+        }
+
+        await recomputeAttendanceSummaryForClass(client, classIdNum);
+        await client.query("COMMIT");
+        transactionOpen = false;
+
+        return res.send({
+            message: "Student timestamps saved"
+        });
+    } catch (error) {
+        if (transactionOpen) {
+            try {
+                await client.query("ROLLBACK");
+            } catch (rollbackError) {
+                console.error("Failed rolling back /save_student_timestamps transaction:", rollbackError);
+            }
+        }
+        console.error("❌ Database error saving student timestamps:", error);
+        return res.status(500).send({ error: "Internal server error" });
+    } finally {
+        client.release();
+    }
 
 });
 

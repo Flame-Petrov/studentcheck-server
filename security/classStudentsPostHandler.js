@@ -8,9 +8,8 @@ const parsePositiveInt = (value) => {
 
 const getClassIdFromRequest = (req) => {
     const queryClassId = req?.query?.class_id;
-    const bodyClassIdSnake = req?.body?.class_id;
-    const bodyClassIdCamel = req?.body?.classId;
-    return parsePositiveInt(queryClassId ?? bodyClassIdSnake ?? bodyClassIdCamel);
+    const bodyClassId = req?.body?.class_id;
+    return parsePositiveInt(queryClassId ?? bodyClassId);
 };
 
 const extractNormalizedFaculty = (student, normalize) => {
@@ -38,19 +37,7 @@ const resolveTeacherIdentity = async ({ req, pool, normalize, hashForLookup }) =
         }
     }
 
-    const fallbackEmailRaw =
-        req?.body?.teacherEmail ??
-        req?.body?.teacher_email ??
-        req?.query?.teacherEmail ??
-        req?.query?.teacher_email;
-    const fallbackEmail = normalizeEmail(fallbackEmailRaw);
-    if (!fallbackEmail) return null;
-
-    const hash = hashForLookup(fallbackEmail);
-    const result = await pool.query("SELECT id FROM teachers WHERE email_hash = $1", [hash]);
-    if (!result.rows.length) return null;
-
-    return { teacherId: parsePositiveInt(result.rows[0].id), teacherEmail: fallbackEmail, source: "fallback_email" };
+    return null;
 };
 
 const buildPostClassStudentsHandler = ({ pool, normalize, hashForLookup, addStudentsToClass, logger = console }) => {
