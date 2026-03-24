@@ -1,5 +1,4 @@
 const PORT = process.env.PORT || 3000;
-const DATABASE_URL = "postgresql://postgres:Flame-Supabase01!@db.imnqwnpsuapkbbnuufqn.supabase.co:5432/postgres";
 
 const express = require("express");
 const cors = require("cors");
@@ -327,6 +326,30 @@ const logRequestEnd = (req, res) => {
     });
 };
 
+// Structured error logger for route handlers.  Extracts the request ID from the
+// action context so every error log is correlated with its request lifecycle.
+const logRouteError = (req, eventName, err, extra = {}) => {
+    const context = getActionContext(req);
+    emitLog("error", eventName, {
+        rid: shortRequestId(context.requestId),
+        action: context.actionName,
+        errorCode: err?.code || null,
+        errorMessage: err?.message || String(err),
+        stack: err?.stack || null,
+        ...extra,
+    });
+};
+
+// Structured informational step logger for route handlers (auth checks, DB ops, etc.).
+const logRouteStep = (req, eventName, data = {}) => {
+    const context = getActionContext(req);
+    emitLog("info", eventName, {
+        rid: shortRequestId(context.requestId),
+        action: context.actionName,
+        ...data,
+    });
+};
+
 console.error = (...args) => writeLogWithSeparator(rawError, `[ERROR ${formatBgTime()}]`, ...args);
 console.warn = (...args) => writeLogWithSeparator(rawWarn, `[WARN ${formatBgTime()}]`, ...args);
 console.info = (...args) => writeLogWithSeparator(rawInfo, `[INFO ${formatBgTime()}]`, ...args);
@@ -461,12 +484,21 @@ app.use((req, res, next) => {
 });
 
 // connect to PostgreSQL
+// DATABASE_URL must be the direct Supabase connection (port 5432), NOT the PgBouncer
+// pooler URL (port 6543). PgBouncer's transaction mode does not support the DDL
+// statements (ALTER TABLE, CREATE INDEX …) that run during server startup.
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // we'll use this later
-  host: "db.imnqwnpsuapkbbnuufqn.supabase.co",
-  ssl: {
-    rejectUnauthorized: false, // 🔒 required for Render
-  },
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false,
+    },
+    // Fail fast on connection attempts so startup errors surface immediately rather
+    // than after the default 30 s socket hang.
+    connectionTimeoutMillis: 10000,
+    // Release idle clients after 30 s to avoid stale sockets toward the DB.
+    idleTimeoutMillis: 30000,
+    // Cap the pool size; Render free-tier Postgres limits concurrent connections.
+    max: 10,
 });
 
 const db = createDbAdapter(pool);
@@ -741,6 +773,12 @@ const applyAttendanceSchemaMigration = async (client) => {
         ALTER TABLE attendances
             ALTER COLUMN count SET NOT NULL;
 
+        ALTER TABLE attendances
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+        UPDATE attendances
+        SET updated_at = NOW()
+        WHERE updated_at IS NULL;
+
         ALTER TABLE attendance_timestamps
             ADD COLUMN IF NOT EXISTS session_key TEXT,
             ADD COLUMN IF NOT EXISTS status TEXT,
@@ -945,61 +983,99 @@ const verifyAndPrintTables = async (client) => {
 
 
 (async () => {
-  let client;
-  try {
+    const DB_STARTUP_RETRIES = 3;
+    const DB_STARTUP_RETRY_DELAY_MS = 3000;
+
+    // Extract host from DATABASE_URL for diagnostic logging (never log the full URL).
+    const resolvedDbHost = (() => {
+        try {
+            const u = new URL(process.env.DATABASE_URL || "");
+            return `${u.hostname}:${u.port || 5432}`;
+        } catch {
+            return "(unparseable DATABASE_URL)";
+        }
+    })();
+
     emitLog("info", "DB_STARTUP_BEGIN", {
+        dbHost: resolvedDbHost,
         applyEncryptionMigration: APPLY_ENCRYPTION_MIGRATION,
         applyEncryptionBackfill: APPLY_ENCRYPTION_BACKFILL,
     });
-    client = await pool.connect();
-    emitLog("info", "DB_CONNECTED", {});
 
-    const result = await client.query("SELECT NOW() AS server_time");
-        emitLog("info", "DB_SERVER_TIME", {
-            serverTime: formatServerTime(result.rows[0]?.server_time),
-        });
-        // --- Ensure required tables exist (idempotent) ---
-        await client.query(`
-            CREATE TABLE IF NOT EXISTS classes (
-                id SERIAL PRIMARY KEY,
-                teacher_id INTEGER NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
-                name TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS attendances (
-                id SERIAL PRIMARY KEY,
-                class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
-                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-                timestamp TIMESTAMPTZ DEFAULT NOW(),
-                UNIQUE(class_id, student_id)
-            );
-        `);
-        await applyAttendanceSchemaMigration(client);
-        emitLog("info", "DB_ATTENDANCE_SCHEMA_READY", {});
-        await db.ensureBillingTables();
-        emitLog("info", "DB_BILLING_TABLES_READY", {});
-        await verifyAndPrintTables(client);
-        if (APPLY_ENCRYPTION_MIGRATION) {
-            emitLog("info", "DB_ENCRYPTION_MIGRATION_START", {});
-            await applyEncryptionMigration(client);
-            emitLog("info", "DB_ENCRYPTION_MIGRATION_END", {});
-        } else {
-            emitLog("info", "DB_ENCRYPTION_MIGRATION_SKIPPED", {});
+    for (let attempt = 1; attempt <= DB_STARTUP_RETRIES; attempt += 1) {
+        let client;
+        try {
+            emitLog("info", "DB_CONNECT_ATTEMPT", { attempt, dbHost: resolvedDbHost });
+            client = await pool.connect();
+            emitLog("info", "DB_CONNECTED", { attempt, dbHost: resolvedDbHost });
+
+            const result = await client.query("SELECT NOW() AS server_time");
+            emitLog("info", "DB_SERVER_TIME", {
+                serverTime: formatServerTime(result.rows[0]?.server_time),
+            });
+
+            // --- Ensure required tables exist (idempotent) ---
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS classes (
+                    id SERIAL PRIMARY KEY,
+                    teacher_id INTEGER NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS attendances (
+                    id SERIAL PRIMARY KEY,
+                    class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+                    student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(class_id, student_id)
+                );
+            `);
+            await applyAttendanceSchemaMigration(client);
+            emitLog("info", "DB_ATTENDANCE_SCHEMA_READY", {});
+            await db.ensureBillingTables();
+            emitLog("info", "DB_BILLING_TABLES_READY", {});
+            await verifyAndPrintTables(client);
+            if (APPLY_ENCRYPTION_MIGRATION) {
+                emitLog("info", "DB_ENCRYPTION_MIGRATION_START", {});
+                await applyEncryptionMigration(client);
+                emitLog("info", "DB_ENCRYPTION_MIGRATION_END", {});
+            } else {
+                emitLog("info", "DB_ENCRYPTION_MIGRATION_SKIPPED", {});
+            }
+            if (APPLY_ENCRYPTION_BACKFILL) {
+                emitLog("info", "DB_ENCRYPTION_BACKFILL_START", {});
+                const backfillSummary = await backfillEncryptionForExistingData(client);
+                emitLog("info", "DB_ENCRYPTION_BACKFILL_END", backfillSummary);
+            } else {
+                emitLog("info", "DB_ENCRYPTION_BACKFILL_SKIPPED", {});
+            }
+            emitLog("info", "DB_STARTUP_END", {});
+            break; // success — exit retry loop
+        } catch (err) {
+            const isTimeout = err.code === "ETIMEDOUT" || err.message?.includes("timeout") || err instanceof AggregateError;
+            emitLog("error", "DB_STARTUP_ERROR", {
+                attempt,
+                dbHost: resolvedDbHost,
+                errorCode: err.code || null,
+                errorName: err.name || null,
+                errorMessage: err.message || String(err),
+                isTimeout,
+                willRetry: attempt < DB_STARTUP_RETRIES,
+            });
+            if (attempt < DB_STARTUP_RETRIES) {
+                emitLog("info", "DB_STARTUP_RETRY_WAIT", { delayMs: DB_STARTUP_RETRY_DELAY_MS, nextAttempt: attempt + 1 });
+                await new Promise((resolve) => setTimeout(resolve, DB_STARTUP_RETRY_DELAY_MS));
+            } else {
+                emitLog("error", "DB_STARTUP_FAILED", {
+                    dbHost: resolvedDbHost,
+                    hint: "Verify DATABASE_URL points to the direct Supabase connection (port 5432), not the PgBouncer pooler (port 6543).",
+                });
+            }
+        } finally {
+            if (client) {
+                client.release();
+            }
         }
-        if (APPLY_ENCRYPTION_BACKFILL) {
-            emitLog("info", "DB_ENCRYPTION_BACKFILL_START", {});
-            const backfillSummary = await backfillEncryptionForExistingData(client);
-            emitLog("info", "DB_ENCRYPTION_BACKFILL_END", backfillSummary);
-        } else {
-            emitLog("info", "DB_ENCRYPTION_BACKFILL_SKIPPED", {});
-        }
-        emitLog("info", "DB_STARTUP_END", {});
-  } catch (err) {
-    console.error("[DB] Startup initialization error:", err);
-  } finally {
-    if (client) {
-        client.release();
     }
-  }
 })();
 
 const tryDecryptValue = (value) => {
@@ -1243,7 +1319,7 @@ const recomputeAttendanceSummaryForClass = async (client, classId) => {
               AND ${ATTENDANCE_DERIVED_COUNT_FILTER_SQL}
             GROUP BY class_id, student_id
         )
-        INSERT INTO attendances (class_id, student_id, count, timestamp)
+        INSERT INTO attendances (class_id, student_id, count, updated_at)
         SELECT
             d.class_id,
             d.student_id,
@@ -1253,7 +1329,7 @@ const recomputeAttendanceSummaryForClass = async (client, classId) => {
         ON CONFLICT (class_id, student_id)
         DO UPDATE SET
             count = EXCLUDED.count,
-            timestamp = NOW()
+            updated_at = NOW()
         `,
         [classIdNum]
     );
@@ -1263,7 +1339,7 @@ const recomputeAttendanceSummaryForClass = async (client, classId) => {
         UPDATE attendances a
         SET
             count = 0,
-            timestamp = NOW()
+            updated_at = NOW()
         WHERE a.class_id = $1
           AND NOT EXISTS (
               SELECT 1
@@ -1426,7 +1502,7 @@ app.post("/teacherLogin", async (req, res) => {
             loginSuccess: true
         });
     } catch (error) {
-        console.error("[AUTH] Database error during teacher login:", error);
+        logRouteError(req, "TEACHER_LOGIN_ERROR", error);
         return res.status(500).send({
             error: "Internal server error"
         });
@@ -1607,7 +1683,7 @@ app.post("/studentLogin", async (req, res) => {
             loginSuccess: true
         });
     } catch (error) {
-        console.error("[AUTH] Database error during student login:", error);
+        logRouteError(req, "STUDENT_LOGIN_ERROR", error);
         return res.status(500).send({
             error: "Internal server error"
         });
@@ -1749,7 +1825,7 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
     } catch (error) {
         const mapped = mapRegistrationUniqueViolation(error);
         if (mapped && mapped.type === "duplicate_email") {
-            console.warn("[REGISTRATION][DUPLICATE_EMAIL]", { requestId, constraint: mapped.constraint });
+            logRouteStep(req, "REGISTRATION_DUPLICATE_EMAIL", { requestId, constraint: mapped.constraint });
             return res.status(409).send({
                 error: "Registration failed. Please use a different email or faculty number.",
                 conflicts: { email: true, facultyNumber: false },
@@ -1757,7 +1833,7 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
             });
         }
         if (mapped && mapped.type === "duplicate_faculty_number") {
-            console.warn("[REGISTRATION][DUPLICATE_FACULTY]", { requestId, constraint: mapped.constraint });
+            logRouteStep(req, "REGISTRATION_DUPLICATE_FACULTY", { requestId, constraint: mapped.constraint });
             return res.status(409).send({
                 error: "Registration failed. Please use a different email or faculty number.",
                 conflicts: { email: false, facultyNumber: true },
@@ -1765,7 +1841,7 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
             });
         }
         if (mapped && mapped.type === "id_collision") {
-            console.error("[REGISTRATION][ID_COLLISION_UNRECOVERED]", {
+            logRouteError(req, "REGISTRATION_ID_COLLISION_UNRECOVERED", error, {
                 requestId,
                 constraint: mapped.constraint,
                 retryFailed: Boolean(error.registrationRetryFailed),
@@ -1773,14 +1849,14 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
             return res.status(500).send({ error: "Internal server error", registrationSuccess: false });
         }
         // Unique violation (email or other unique columns)
-        if (error && error.code === '23505') {
-            console.warn('⚠️ Duplicate registration attempt:', error.detail || error.constraint);
-            return res.status(409).send({ 
+        if (error && error.code === "23505") {
+            logRouteStep(req, "REGISTRATION_DUPLICATE_UNIQUE_VIOLATION", { requestId, constraint: error.constraint, detail: error.detail });
+            return res.status(409).send({
                 error: "Registration failed. Please use a different email or faculty number.",
                 registrationSuccess: false
             });
         }
-        console.error("❌ Database error during registration:", error);
+        logRouteError(req, "REGISTRATION_ERROR", error, { requestId });
         return res.status(500).send({ error: "Internal server error", registrationSuccess: false });
     }
 });
@@ -1833,7 +1909,7 @@ app.get("/students", async (req, res) => {
         const students = result.rows.map((row) => withStudentResponseIdentifiers(row, { endpoint: "GET /students" }));
         return res.send({ students });
     } catch (error) {
-        console.error("❌ Database error fetching students:", error);
+        logRouteError(req, "STUDENTS_FETCH_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -1861,14 +1937,13 @@ app.post("/classes", requireTeacherAuth, async (req, res) => {
         const created = insertResult.rows[0];
 
         if (Array.isArray(students) && students.length > 0) {
-            const assignmentResult = await addStudentsToClass(created.id, students);
-        } else {
+            await addStudentsToClass(created.id, students);
         }
 
         res.status(201).send({ message: "Class created", class: created });
 
     } catch (error) {
-        console.error("❌ Database error creating class:", error);
+        logRouteError(req, "CLASS_CREATE_ERROR", error);
         res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -1948,7 +2023,7 @@ app.get("/classes", async (req, res) => {
             return res.send({ message: "All classes fetched", classes: classes.rows });
         }
     } catch (error) {
-        console.error("❌ Database error fetching classes:", error);
+        logRouteError(req, "CLASSES_FETCH_ERROR", error);
         res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -1992,7 +2067,7 @@ app.put("/classes", requireTeacherAuth, async (req, res) => {
 
         return res.status(200).send({ success: true });
     } catch (error) {
-        console.error("❌ Database error renaming class:", error);
+        logRouteError(req, "CLASS_RENAME_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -2045,7 +2120,7 @@ app.delete("/classes", requireTeacherAuth, async (req, res) => {
         return res.status(200).send({ success: true });
     } catch (error) {
         await client.query("ROLLBACK");
-        console.error("❌ Database error deleting class:", error);
+        logRouteError(req, "CLASS_DELETE_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     } finally {
         client.release();
@@ -2107,7 +2182,7 @@ app.get("/class_students", async (req, res) => {
             students
         });
     } catch (error) {
-        console.error("Database error fetching class students:", error);
+        logRouteError(req, "CLASS_STUDENTS_FETCH_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -2282,7 +2357,7 @@ app.post("/attendance", async (req, res) => {
         const { rows } = await pool.query(upsertSql, [classIdNum, resolvedStudentId]);
         return res.status(200).send({ success: true, attendance: rows[0] });
     } catch (error) {
-        console.error("❌ Database error recording attendance:", error);
+        logRouteError(req, "ATTENDANCE_RECORD_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -2554,10 +2629,10 @@ app.post("/attendance/finish", async (req, res) => {
             try {
                 await client.query("ROLLBACK");
             } catch (rollbackError) {
-                console.error("Failed rolling back /attendance/finish transaction:", rollbackError);
+                logRouteError(req, "ATTENDANCE_FINISH_ROLLBACK_ERROR", rollbackError);
             }
         }
-        console.error("❌ Database error finishing attendance session:", error);
+        logRouteError(req, "ATTENDANCE_FINISH_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     } finally {
         client.release();
@@ -2569,7 +2644,6 @@ app.get("/attendance", async (req, res) => {
     logRequestStart(req);
     
     const classId = req.query.class_id;
-    const studentId = req.query.student_id;
 
     try {
         if (classId) {
@@ -2584,23 +2658,23 @@ app.get("/attendance", async (req, res) => {
                 FROM attendances a
                 JOIN students s ON a.student_id = s.id
                 WHERE a.class_id = $1
-                ORDER BY a.timestamp DESC
+                ORDER BY a.updated_at DESC
             `, [classId]);
             return res.send({ message: "Attendance fetched", attendance: rows.rows });
         }
 
 
         const rows = await pool.query(`
-            SELECT a.id, a.class_id, a.student_id, a.timestamp,
+            SELECT a.id, a.class_id, a.student_id, a.updated_at,
                          s.full_name AS student_name, c.name AS class_name
             FROM attendances a
             JOIN students s ON a.student_id = s.id
             JOIN classes c ON a.class_id = c.id
-            ORDER BY a.timestamp DESC
+            ORDER BY a.updated_at DESC
         `);
         return res.send({ message: "All attendance fetched", attendance: rows.rows });
     } catch (error) {
-        console.error("❌ Database error fetching attendance:", error);
+        logRouteError(req, "ATTENDANCE_FETCH_ERROR", error);
         res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -2645,7 +2719,7 @@ app.get("/attendance/timestamps", async (req, res) => {
         const timestamps = rows.rows.map((row) => withAttendanceStudentIdentifiers(row));
         return res.send({ timestamps });
     } catch (error) {
-        console.error("❌ Database error fetching attendance timestamps:", error);
+        logRouteError(req, "ATTENDANCE_TIMESTAMPS_FETCH_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -2715,7 +2789,7 @@ app.get("/attendance/history", async (req, res) => {
         const records = rows.map((row) => withAttendanceStudentIdentifiers(row));
         return res.status(200).send({ records });
     } catch (error) {
-        console.error("❌ Database error fetching attendance history:", error);
+        logRouteError(req, "ATTENDANCE_HISTORY_FETCH_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -2761,7 +2835,7 @@ app.get("/attendance/summary", async (req, res) => {
         const items = rows.map((row) => withAttendanceStudentIdentifiers(row));
         return res.status(200).send({ items });
     } catch (error) {
-        console.error("❌ Database error fetching attendance summary:", error);
+        logRouteError(req, "ATTENDANCE_SUMMARY_FETCH_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -2858,7 +2932,7 @@ app.post("/class_students/remove", requireTeacherAuth, async (req, res) => {
         });
 
     } catch (error) {
-        console.error("❌ Database error removing student from class:", error);
+        logRouteError(req, "CLASS_STUDENT_REMOVE_ERROR", error);
         res.status(500).send({ error: "Internal server error" });
     }
 });
@@ -3011,10 +3085,10 @@ app.post("/save_student_timestamps", async (req, res) => {
             try {
                 await client.query("ROLLBACK");
             } catch (rollbackError) {
-                console.error("Failed rolling back /save_student_timestamps transaction:", rollbackError);
+                logRouteError(req, "SAVE_TIMESTAMPS_ROLLBACK_ERROR", rollbackError);
             }
         }
-        console.error("❌ Database error saving student timestamps:", error);
+        logRouteError(req, "SAVE_TIMESTAMPS_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     } finally {
         client.release();
