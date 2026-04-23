@@ -3229,8 +3229,8 @@ app.post("/support/chat", async (req, res) => {
 
     try {
         const model = genAI.getGenerativeModel({
-            model: "gemini-1.5-flash",
-        }, { apiVersion: "v1" });
+            model: "gemini-1.5-flash-latest",
+        });
 
         const chat = model.startChat({history: chatHistory});
         const result = await chat.sendMessage(message.slice(0, 1000));
