@@ -3195,7 +3195,10 @@ app.post("/support/chat", async (req, res) => {
         return res.status(400).send({ error: "message is required"})
     }
 
-    const chatHistory = []
+    const chatHistory = [
+        { role: "user", parts: [{ text: `System Instruction: ${SUPPORT_SYSTEM_PROMPT}` }] },
+        { role: "model", parts: [{ text: "Understood. I am ready to help." }] }
+    ];
 
     if(Array.isArray(history)){
         for(const entry of history){
@@ -3227,7 +3230,6 @@ app.post("/support/chat", async (req, res) => {
     try {
         const model = genAI.getGenerativeModel({
             model: "gemini-1.5-flash",
-            systemInstruction: SUPPORT_SYSTEM_PROMPT,
         }, { apiVersion: "v1" });
 
         const chat = model.startChat({history: chatHistory});
