@@ -3252,7 +3252,7 @@ app.post("/support/chat", async (req, res) => {
 
     try {
         const model = genAI.getGenerativeModel({
-            model: "gemini-1.5-flash-latest",
+            model: "gemini-2.5-flash",
             generationConfig: {
                 maxOutputTokens: 120,  //  // Limit length   
                 temperature: 0.2,       // lower = more controlled
