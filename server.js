@@ -3232,12 +3232,21 @@ app.post("/support/chat", async (req, res) => {
 
         const chat = model.startChat({history: chatHistory});
         const result = await chat.sendMessage(message.slice(0, 1000));
-        const reply = result.response.text() || "Sorry, I couldn't generate a response.";
+        
+        let reply;
+        try {
+            reply = result.response.text();
+        } catch (textError) {
+            // Handle cases where the response is blocked by safety settings
+            reply = "I'm sorry, but I cannot fulfill that request due to safety restrictions.";
+        }
+        reply = reply || "Sorry, I couldn't generate a response.";
         
         return res.send({ reply });
-    }catch (error){
+    } catch (error) {
         logRouteError(req, "SUPPORT_CHAT_ERROR", error);
-        return res.status(500).send({ error: "Support service unavailable" });
+        const errorMessage = error?.message || "Support service unavailable";
+        return res.status(500).send({ error: `Gemini API Error: ${errorMessage}` });
     }
 });
 
