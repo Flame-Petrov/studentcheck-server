@@ -44,6 +44,7 @@ const {
     JWT_AUDIENCE,
     JWT_EXPIRES_IN_SECONDS,
 } = require("./security/jwtConfig");
+const req = require("express/lib/request");
 
 if (!String(process.env.AUTH_PEPPER || "").trim()) {
     throw new Error("AUTH_PEPPER is required");
@@ -3178,6 +3179,52 @@ app.post("/update_completed_classes_count", requireTeacherAuth, async (req, res)
     });
 
 });
+
+
+
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const SUPPORT_SYSTEM_PROMPT = "You are a helpful support assistant for StudentCheck, a student attendance tracking platform."
+
+app.post("/support/chat", async (req, res) => {
+    logRequestStart(req, {uncludeBody: false});
+
+    const { message, history } = req.body || {};
+
+    if(!message || typeof message !== "string" || !message.trim()){
+        return res.status(400).send({ error: "message is required"})
+    }
+
+    const chatHistory = []
+
+    if(Array.isArray(history)){
+        for(const entry in history){
+            if(entry && typeof entry.role === "string" && typeof entry.content === "string" && ["user", "model"].includes(entry.role)){
+                chatHistory.push({
+                    role: entry.role,
+                    parts: [{text: entry.content.slice(0, 1000)}] // Limit content length for safety
+                });
+            }
+        }
+    }
+
+    try {
+        const model = genAI.getGenerativeModel({
+            model: "gemini-1.5-flash",
+            systemInstruction: SUPPORT_SYSTEM_PROMPT,
+        });
+
+        const chat = model.startChat({history: chatHistory});
+        const result = await chat.sendMessage(message.slice(0, 1000));
+        const reply = result.response.text() || "Sorry, I couldn't generate a response.";
+        
+        return res.send({ reply });
+    }catch (error){
+        logRouteError(req, "SUPPORT_CHAT_ERROR", error);
+        return res.status(500).send({ error: "Support service unavailable" });
+    }
+});
+
 
 
 
