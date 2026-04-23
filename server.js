@@ -3199,17 +3199,28 @@ app.post("/support/chat", async (req, res) => {
 
     if(Array.isArray(history)){
         for(const entry of history){
-            if(entry && typeof entry.role === "string" && typeof entry.content === "string" && ["user", "model"].includes(entry.role)){
-                chatHistory.push({
-                    role: entry.role,
-                    parts: [{text: entry.content.slice(0, 1000)}] // Limit content length for safety
-                });
+            if(entry && typeof entry.role === "string" && typeof entry.content === "string" && entry.content.trim() !== "" && ["user", "model"].includes(entry.role)){
+                const text = entry.content.slice(0, 1000); // Limit content length for safety
+                if (chatHistory.length === 0) {
+                    // Gemini requires the chat history to always start with a 'user' message.
+                    if (entry.role === "user") {
+                        chatHistory.push({ role: "user", parts: [{ text }] });
+                    }
+                } else {
+                    const lastMessage = chatHistory[chatHistory.length - 1];
+                    // Combine consecutive messages of the same role to maintain strict alternation
+                    if (lastMessage.role === entry.role) {
+                        lastMessage.parts[0].text += "\n" + text;
+                    } else {
+                        chatHistory.push({ role: entry.role, parts: [{ text }] });
+                    }
+                }
             }
         }
 
-        // Gemini requires the chat history to always start with a 'user' message.
-        while (chatHistory.length > 0 && chatHistory[0].role !== "user") {
-            chatHistory.shift();
+        // The history passed to startChat must end with a 'model' message so the new sendMessage('user') maintains alternation.
+        if (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === "user") {
+            chatHistory.pop();
         }
     }
 
@@ -3245,6 +3256,25 @@ app.get("/backup/download", downloadBackup);
 
 // ----------------- Database Backup Encrypt Endpoint -----------------
 app.post("/backup/encrypt", encryptBackup);
+
+// ----------------- Database Backup Decrypt Endpoint -----------------
+app.post("/backup/decrypt", decryptBackup);
+
+// ----------------- Database Backup Encrypt User Fields Endpoint -----------------
+app.post("/backup/encrypt-user-fields", encryptUserFields);
+
+// ----------------- Drop Encryption/Hash Columns Endpoint -----------------
+app.post("/backup/drop-encryption-columns", dropEncryptionColumns);
+
+// ----------------- Database Backup Import Endpoint -----------------
+app.post("/backup/import", importBackup);
+
+app.listen(PORT, () => {
+    emitLog("info", "SERVER_LISTENING", {
+        port: Number(PORT),
+        nodeEnv: process.env.NODE_ENV || "development",
+    });
+});
 
 // ----------------- Database Backup Decrypt Endpoint -----------------
 app.post("/backup/decrypt", decryptBackup);
