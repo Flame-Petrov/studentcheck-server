@@ -3187,7 +3187,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const SUPPORT_SYSTEM_PROMPT = "You are a helpful support assistant for StudentCheck, a student attendance tracking platform."
 
 app.post("/support/chat", async (req, res) => {
-    logRequestStart(req, {uncludeBody: false});
+    logRequestStart(req, {includeBody: false});
 
     const { message, history } = req.body || {};
 
@@ -3205,6 +3205,11 @@ app.post("/support/chat", async (req, res) => {
                     parts: [{text: entry.content.slice(0, 1000)}] // Limit content length for safety
                 });
             }
+        }
+
+        // Gemini requires the chat history to always start with a 'user' message.
+        while (chatHistory.length > 0 && chatHistory[0].role !== "user") {
+            chatHistory.shift();
         }
     }
 
