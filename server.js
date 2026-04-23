@@ -3184,7 +3184,18 @@ app.post("/update_completed_classes_count", requireTeacherAuth, async (req, res)
 
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const SUPPORT_SYSTEM_PROMPT = "You are a helpful support assistant for StudentCheck, a student attendance tracking platform."
+const SUPPORT_SYSTEM_PROMPT = `
+You are a concise assistant.
+
+Rules:
+- Answer in 1–3 short sentences
+- No introductions or apologies
+- No bullet points unless explicitly requested
+- Do not ask multiple follow-up questions
+- Be direct and practical
+- Sound like a real person chatting, not a support agent
+
+`
 
 app.post("/support/chat", async (req, res) => {
     logRequestStart(req, {includeBody: false});
@@ -3230,6 +3241,12 @@ app.post("/support/chat", async (req, res) => {
     try {
         const model = genAI.getGenerativeModel({
             model: "gemini-2.5-flash",
+            systemInstruction: SUPPORT_SYSTEM_PROMPT,
+            generationConfig: {
+                maxOutputTokens: 120,  //  // Limit length   
+                temperature: 0.2,       // lower = more controlled
+                topP: 0.8,              
+            },
         });
 
         const chat = model.startChat({history: chatHistory});
