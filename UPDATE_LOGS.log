@@ -1,3 +1,4 @@
 --- UPDATE LOGS ---
 [2026-04-23] Initialized UPDATE_LOGS.log to track future changes to the codebase.
 [2026-04-23] Improved error handling in POST /support/chat to expose Gemini API errors to the frontend and gracefully handle safety blocks.
+[2026-04-23] Removed systemInstruction from Gemini API call and injected it into chatHistory to fix 400 Bad Request payload errors on the v1 endpoint.
