@@ -3275,22 +3275,3 @@ app.listen(PORT, () => {
         nodeEnv: process.env.NODE_ENV || "development",
     });
 });
-
-// ----------------- Database Backup Decrypt Endpoint -----------------
-app.post("/backup/decrypt", decryptBackup);
-
-// ----------------- Database Backup Encrypt User Fields Endpoint -----------------
-app.post("/backup/encrypt-user-fields", encryptUserFields);
-
-// ----------------- Drop Encryption/Hash Columns Endpoint -----------------
-app.post("/backup/drop-encryption-columns", dropEncryptionColumns);
-
-// ----------------- Database Backup Import Endpoint -----------------
-app.post("/backup/import", importBackup);
-
-app.listen(PORT, () => {
-    emitLog("info", "SERVER_LISTENING", {
-        port: Number(PORT),
-        nodeEnv: process.env.NODE_ENV || "development",
-    });
-});
