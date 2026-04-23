@@ -3198,7 +3198,7 @@ app.post("/support/chat", async (req, res) => {
     const chatHistory = []
 
     if(Array.isArray(history)){
-        for(const entry in history){
+        for(const entry of history){
             if(entry && typeof entry.role === "string" && typeof entry.content === "string" && ["user", "model"].includes(entry.role)){
                 chatHistory.push({
                     role: entry.role,
