@@ -3212,7 +3212,7 @@ app.post("/support/chat", async (req, res) => {
         const model = genAI.getGenerativeModel({
             model: "gemini-1.5-flash",
             systemInstruction: SUPPORT_SYSTEM_PROMPT,
-        });
+        }, { apiVersion: "v1" });
 
         const chat = model.startChat({history: chatHistory});
         const result = await chat.sendMessage(message.slice(0, 1000));
@@ -3259,4 +3259,3 @@ app.listen(PORT, () => {
         nodeEnv: process.env.NODE_ENV || "development",
     });
 });
-
