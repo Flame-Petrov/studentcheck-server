@@ -3274,7 +3274,7 @@ app.post("/support/chat", async (req, res) => {
             // model: "gemini-2.5-flash",
             model: "gemini-2.5-flash-lite",
             generationConfig: {
-                maxOutputTokens: 120,  //  // Limit length   
+                maxOutputTokens: 800,  // Increased limit to prevent cut-off responses
                 temperature: 0.2,       // lower = more controlled
                 topP: 0.8,              
             },
