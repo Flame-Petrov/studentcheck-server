@@ -3224,14 +3224,21 @@ ${APP_RESUME_CONTENT}
 app.post("/support/chat", async (req, res) => {
     logRequestStart(req, {includeBody: false});
 
-    const { message, history } = req.body || {};
+    const { message, history, language } = req.body || {};
 
     if(!message || typeof message !== "string" || !message.trim()){
         return res.status(400).send({ error: "message is required"})
     }
 
+    let dynamicSystemPrompt = TRUE_ASSISTANT_SYSTEM_PROMPT;
+    if (language === 'bg') {
+        dynamicSystemPrompt += "\n\nThe user's application interface is set to Bulgarian. You MUST respond to all queries in Bulgarian.";
+    } else if (language === 'en') {
+        dynamicSystemPrompt += "\n\nThe user's application interface is set to English. You MUST respond to all queries in English.";
+    }
+
     const chatHistory = [
-        { role: "user", parts: [{ text: `System Instruction: ${TRUE_ASSISTANT_SYSTEM_PROMPT}` }] },
+        { role: "user", parts: [{ text: `System Instruction: ${dynamicSystemPrompt}` }] },
         { role: "model", parts: [{ text: "Understood. I am ready to help." }] }
     ];
 
@@ -3271,7 +3278,7 @@ app.post("/support/chat", async (req, res) => {
                 temperature: 0.2,       // lower = more controlled
                 topP: 0.8,              
             },
-            systemInstruction: TRUE_ASSISTANT_SYSTEM_PROMPT
+            systemInstruction: dynamicSystemPrompt
         });
 
         const chat = model.startChat({history: chatHistory});
