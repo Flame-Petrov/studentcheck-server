@@ -3324,7 +3324,6 @@ app.post("/support/chat", async (req, res) => {
 
         // 3. Fallback for all other unexpected errors
         logRouteError(req, "SUPPORT_CHAT_ERROR", error);
-        const errorMessage = error?.message || "Support service unavailable";
         return res.status(500).send({ error: `Gemini API Error: ${errorMessage}` });
     }
 });
