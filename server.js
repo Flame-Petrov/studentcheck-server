@@ -3300,6 +3300,29 @@ app.post("/support/chat", async (req, res) => {
 
         return res.send({ reply });
     } catch (error) {
+        const errorMessage = error?.message || String(error) || "Support service unavailable";
+
+        // 1. Catch Rate Limit / Quota Errors specifically
+        if (errorMessage.includes('429') || errorMessage.includes('quota')) {
+            emitLog("warn", "SUPPORT_CHAT_RATE_LIMITED", {
+                rid: shortRequestId(getActionContext(req).requestId),
+                errorSummary: errorMessage.substring(0, 150) + "..."
+            });
+            return res.status(429).send({ 
+                error: 'The AI is currently receiving too many requests.',
+                details: '429 Quota Exceeded'
+            });
+        }
+
+        // 2. Catch Overloaded / Service Unavailable
+        if (errorMessage.includes('503') || errorMessage.includes('overloaded')) {
+            emitLog("warn", "SUPPORT_CHAT_OVERLOADED", {
+                rid: shortRequestId(getActionContext(req).requestId)
+            });
+            return res.status(503).send({ error: 'The AI service is overloaded.' });
+        }
+
+        // 3. Fallback for all other unexpected errors
         logRouteError(req, "SUPPORT_CHAT_ERROR", error);
         const errorMessage = error?.message || "Support service unavailable";
         return res.status(500).send({ error: `Gemini API Error: ${errorMessage}` });
