@@ -3293,6 +3293,11 @@ app.post("/support/chat", async (req, res) => {
         }
         reply = reply || "Sorry, I couldn't generate a response.";
         
+        logRouteStep(req, "SUPPORT_CHAT_INTERACTION", {
+            userInput: message.slice(0, 1000),
+            botOutput: reply
+        });
+
         return res.send({ reply });
     } catch (error) {
         logRouteError(req, "SUPPORT_CHAT_ERROR", error);
