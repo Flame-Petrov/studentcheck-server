@@ -2198,18 +2198,33 @@ app.get("/get_student_classes", async (req, res) => {
     logRequestStart(req);
 
     const rawStudentId = req.query.student_id;
+    const facultyNumber = req.query.faculty_number;
 
-    if (!rawStudentId || rawStudentId === "undefined" || rawStudentId === "null") {
-        return res.status(400).send({ error: "student_id query parameter is required" });
+    if ((!rawStudentId || rawStudentId === "undefined" || rawStudentId === "null") && !facultyNumber) {
+        return res.status(400).send({ error: "student_id or faculty_number query parameter is required" });
     }
 
-    const studentId = Number(rawStudentId);
-    if (!Number.isFinite(studentId) || studentId <= 0) {
-        return res.status(400).send({ error: "student_id must be a valid number" });
+    let studentIdNum = null;
+    if (rawStudentId && rawStudentId !== "undefined" && rawStudentId !== "null") {
+        studentIdNum = Number(rawStudentId);
+        if (!Number.isFinite(studentIdNum) || studentIdNum <= 0) {
+            return res.status(400).send({ error: "student_id must be a valid number" });
+        }
+    } else if (facultyNumber) {
+        const facNorm = normalize(facultyNumber);
+        const facHash = hashForLookup(facNorm);
+        const studentLookup = await pool.query(
+            "SELECT id FROM students WHERE faculty_number_hash = $1",
+            [facHash]
+        );
+        if (studentLookup.rows.length === 0) {
+            return res.status(200).send({ message: "Student not found", class_names: [] });
+        }
+        studentIdNum = studentLookup.rows[0].id;
     }
 
     const sql = `SELECT * FROM class_students WHERE student_id = $1`;
-    const result  = await pool.query(sql, [studentId]);
+    const result  = await pool.query(sql, [studentIdNum]);
 
 
 
