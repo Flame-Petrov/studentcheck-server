@@ -63,10 +63,57 @@ const rawWarn = console.warn.bind(console);
 const rawError = console.error.bind(console);
 const LOG_SEPARATOR = "======================";
 
+// File-based logging setup
+const LOG_FILE_PATH = path.join(__dirname, 'server.log');
+const LOG_FILE_MAX_SIZE = 50 * 1024 * 1024; // 50MB
+
+const ensureLogFile = () => {
+    if (!fs.existsSync(LOG_FILE_PATH)) {
+        fs.writeFileSync(LOG_FILE_PATH, '');
+    }
+};
+
+const checkAndRotateLogFile = () => {
+    try {
+        if (fs.existsSync(LOG_FILE_PATH)) {
+            const stats = fs.statSync(LOG_FILE_PATH);
+            if (stats.size > LOG_FILE_MAX_SIZE) {
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                const backupPath = path.join(__dirname, `server.log.${timestamp}`);
+                fs.renameSync(LOG_FILE_PATH, backupPath);
+                fs.writeFileSync(LOG_FILE_PATH, '');
+            }
+        }
+    } catch (err) {
+        rawError('Failed to rotate log file:', err.message);
+    }
+};
+
+const writeToLogFile = (content) => {
+    try {
+        ensureLogFile();
+        checkAndRotateLogFile();
+        fs.appendFileSync(LOG_FILE_PATH, content + '\n');
+    } catch (err) {
+        rawError('Failed to write to log file:', err.message);
+    }
+};
+
 const writeLogWithSeparator = (writer, ...args) => {
+    const message = args.map(arg => {
+        if (typeof arg === 'string') return arg;
+        return util.inspect(arg, { depth: 2, colors: false });
+    }).join(' ');
+
     writer(...args);
     writer(LOG_SEPARATOR);
+
+    // Also write to file
+    writeToLogFile(message);
+    writeToLogFile(LOG_SEPARATOR);
 };
+
+ensureLogFile();
 
 const LOG_STRING_PREVIEW_CHARS = Number.parseInt(process.env.LOG_STRING_PREVIEW_CHARS || "220", 10);
 const LOG_PREVIEW_ARRAY_ITEMS = Number.parseInt(process.env.LOG_PREVIEW_ARRAY_ITEMS || "3", 10);
@@ -239,6 +286,14 @@ const emitLog = (level, eventName, payload = {}) => {
     const line = `[${level.toUpperCase()} ${formatBgTime()}] ${eventName}`;
     const details = formatPayloadFields(payload);
     const message = details ? `${line} ${details}` : line;
+
+    // Write to file for all log levels
+    try {
+        writeToLogFile(message);
+    } catch (err) {
+        rawError('Failed to write to log file:', err.message);
+    }
+
     if (level === "error") {
         writeLogWithSeparator(rawError, message);
         return;
