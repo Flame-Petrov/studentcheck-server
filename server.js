@@ -655,6 +655,28 @@ const issueTeacherToken = ({ teacherId, emailHash, email }) => {
     };
 };
 
+// Students get their own token so they can read only their own attendance.
+// role "student" is rejected by requireTeacherAuth.
+const issueStudentToken = ({ studentId }) => {
+    const now = Math.floor(Date.now() / 1000);
+    const expiresInSeconds = JWT_EXPIRES_IN_SECONDS;
+    return {
+        token: signAuthToken({
+            secret: JWT_SECRET,
+            payload: {
+                sub: String(studentId),
+                studentId: Number(studentId),
+                role: "student",
+                iss: JWT_ISSUER,
+                aud: JWT_AUDIENCE,
+                iat: now,
+                exp: now + expiresInSeconds,
+            },
+        }),
+        expiresIn: expiresInSeconds,
+    };
+};
+
 const logAuthEvent = (details) => {
     emitLog("info", "AUTH_EVENT", details);
 };
@@ -785,6 +807,32 @@ const requireOwnedClass = async (req, res, next) => {
     }
 };
 
+const requireStudentAuth = async (req, res, next) => {
+    const parsed = parseAuthorizationHeader(req.headers.authorization);
+    if (!parsed.ok) {
+        return res.status(401).send({ error: parsed.error });
+    }
+    const verification = verifyAuthToken({
+        token: parsed.token,
+        secret: JWT_SECRET,
+        issuer: JWT_ISSUER,
+        audience: JWT_AUDIENCE,
+    });
+    if (!verification.ok || verification.payload.role !== "student") {
+        return res.status(401).send({ error: "Invalid or expired token" });
+    }
+    const studentId = Number.parseInt(String(verification.payload.sub), 10);
+    if (!Number.isInteger(studentId) || studentId <= 0) {
+        return res.status(401).send({ error: "Invalid or expired token" });
+    }
+    const result = await pool.query("SELECT id FROM students WHERE id = $1", [studentId]);
+    if (!result.rows.length) {
+        return res.status(401).send({ error: "Invalid or expired token" });
+    }
+    req.authStudentId = studentId;
+    return next();
+};
+
 // GET /classes?class_id= stays public (the student page reads class names with it);
 // listing classes requires a teacher login.
 const requireTeacherAuthUnlessClassId = (req, res, next) =>
@@ -911,6 +959,12 @@ const applyAttendanceSchemaMigration = async (client) => {
             ALTER COLUMN updated_at SET NOT NULL;
         ALTER TABLE attendance_timestamps
             ALTER COLUMN session_key SET NOT NULL;
+
+        -- Lesson identity shared by every row saved from one attendance session,
+        -- so absences (rows without timestamps) can be placed on a lesson date.
+        ALTER TABLE attendance_timestamps
+            ADD COLUMN IF NOT EXISTS session_id TEXT,
+            ADD COLUMN IF NOT EXISTS session_at TIMESTAMPTZ;
 
         CREATE INDEX IF NOT EXISTS idx_attendance_timestamps_class_student
             ON attendance_timestamps (class_id, student_id);
@@ -1282,6 +1336,17 @@ const withAttendanceStudentIdentifiers = (row = {}) => {
 
 const ATTENDANCE_DERIVED_COUNT_FILTER_SQL = "(joined_at IS NOT NULL OR left_at IS NOT NULL)";
 const ATTENDANCE_POSITIVE_STATUSES = new Set(["attended", "present", "completed", "checked_in", "checked-in"]);
+const ATTENDANCE_ABSENT_STATUS = "absent";
+
+// Client-generated id for one scanner session; reused on retries so a retried
+// Finish updates the same absence rows instead of adding new ones.
+const normalizeAttendanceSessionId = (value) => {
+    const text = typeof value === "string" ? value.trim() : "";
+    return /^[A-Za-z0-9_-]{8,64}$/.test(text) ? text : null;
+};
+
+const buildAbsenceSessionKey = ({ classId, studentId, sessionId }) =>
+    crypto.createHash("sha256").update(`${classId}|${studentId}|absent|${sessionId}`).digest("hex");
 
 const normalizeAttendanceStatus = (value) => {
     if (typeof value !== "string") return null;
@@ -1779,9 +1844,13 @@ app.post("/studentLogin", async (req, res) => {
             ...updates,
         }, { endpoint: "POST /studentLogin" });
 
+        const studentToken = issueStudentToken({ studentId: studentRow.id });
+
         return res.send({
             message: "Student login successful",
             student,
+            token: studentToken.token,
+            expiresIn: studentToken.expiresIn,
             loginSuccess: true
         });
     } catch (error) {
@@ -2347,6 +2416,78 @@ app.get("/get_student_classes", async (req, res) => {
 
 
 
+// ----------------- Student self-service endpoints -----------------
+// The logged-in student's courses with attendance totals, in one request.
+app.get("/student/courses", requireStudentAuth, async (req, res) => {
+    logRequestStart(req);
+    try {
+        const { rows } = await pool.query(
+            `
+            SELECT
+                c.id,
+                c.name,
+                COALESCE(a.count, 0) AS attended,
+                COALESCE(c.completed_classes_count, 0) AS completed_classes_count,
+                (SELECT COALESCE(MAX(a2.count), 0) FROM attendances a2 WHERE a2.class_id = c.id) AS max_attended_in_class
+            FROM class_students cs
+            JOIN classes c ON c.id = cs.class_id
+            LEFT JOIN attendances a ON a.class_id = c.id AND a.student_id = cs.student_id
+            WHERE cs.student_id = $1
+            ORDER BY c.name ASC, c.id ASC
+            `,
+            [req.authStudentId]
+        );
+        const courses = rows.map((row) => {
+            const attended = Number(row.attended) || 0;
+            // Same rule the student page used before: the class's completed count,
+            // else the highest count in the class, and never below this student's count.
+            const recorded = Number(row.completed_classes_count) || 0;
+            const fallback = Number(row.max_attended_in_class) || 0;
+            const total = Math.max(recorded > 0 ? recorded : fallback, attended);
+            return { id: Number(row.id), name: row.name, attended, total };
+        });
+        return res.send({ courses });
+    } catch (error) {
+        logRouteError(req, "STUDENT_COURSES_FETCH_ERROR", error);
+        return res.status(500).send({ error: "Internal server error" });
+    }
+});
+
+// Lesson-by-lesson history of the logged-in student in one of their courses.
+app.get("/student/courses/:classId/lessons", requireStudentAuth, async (req, res) => {
+    logRequestStart(req);
+    const classId = parsePositiveInteger(req.params.classId);
+    if (!classId) {
+        return res.status(400).send({ error: "classId must be a valid positive integer" });
+    }
+    try {
+        const enrollment = await pool.query(
+            "SELECT 1 FROM class_students WHERE class_id = $1 AND student_id = $2 LIMIT 1",
+            [classId, req.authStudentId]
+        );
+        if (!enrollment.rows.length) {
+            return res.status(404).send({ error: "Course not found" });
+        }
+        const { rows } = await pool.query(
+            `
+            SELECT status, joined_at, left_at, session_at, created_at
+            FROM attendance_timestamps
+            WHERE class_id = $1 AND student_id = $2
+            ORDER BY COALESCE(session_at, joined_at, left_at, created_at) ASC, id ASC
+            `,
+            [classId, req.authStudentId]
+        );
+        const lessons = rows.map((row) => ({
+            date: row.session_at || row.joined_at || row.left_at || row.created_at || null,
+            status: row.joined_at || row.left_at ? "present" : (normalizeAttendanceStatus(row.status) || ATTENDANCE_ABSENT_STATUS),
+        }));
+        return res.send({ lessons });
+    } catch (error) {
+        logRouteError(req, "STUDENT_LESSONS_FETCH_ERROR", error);
+        return res.status(500).send({ error: "Internal server error" });
+    }
+});
+
 app.get("/get_class_id_by_name", async (req, res) => {
     logRequestStart(req);
 
@@ -2472,7 +2613,8 @@ app.post("/attendance", requireTeacherAuth, requireOwnedClass, async (req, res) 
 app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
 
-    const { class_id, class_name, records } = req.body || {};
+    const { class_id, class_name, records, session_id } = req.body || {};
+    const sessionId = normalizeAttendanceSessionId(session_id) || crypto.randomUUID();
     const classIdNum = parsePositiveInteger(class_id);
 
     if (!classIdNum) {
@@ -2620,6 +2762,15 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
                         field: "joined_at|left_at",
                         message: "Positive attendance statuses require joined_at or left_at",
                     });
+                } else if (normalizedStatus === ATTENDANCE_ABSENT_STATUS) {
+                    const absentStudentId = Number(resolvedStudent.id);
+                    candidateRecords.push({
+                        studentId: absentStudentId,
+                        status: ATTENDANCE_ABSENT_STATUS,
+                        joinedAt: null,
+                        leftAt: null,
+                        sessionKey: buildAbsenceSessionKey({ classId: classIdNum, studentId: absentStudentId, sessionId }),
+                    });
                 }
                 continue;
             }
@@ -2657,11 +2808,23 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
             });
         }
 
+        // A student who scanned is never also marked absent in the same session.
+        const presentStudentIds = new Set(
+            candidateRecords.filter((row) => row.status !== ATTENDANCE_ABSENT_STATUS).map((row) => row.studentId)
+        );
         const uniqueRecordsBySessionKey = new Map();
         for (const row of candidateRecords) {
+            if (row.status === ATTENDANCE_ABSENT_STATUS && presentStudentIds.has(row.studentId)) continue;
             uniqueRecordsBySessionKey.set(`${row.studentId}:${row.sessionKey}`, row);
         }
         const recordsToPersist = Array.from(uniqueRecordsBySessionKey.values());
+
+        // Lesson date: the earliest scan in this session, or now if nobody scanned.
+        const sessionTimes = recordsToPersist
+            .flatMap((row) => [row.joinedAt, row.leftAt])
+            .map((value) => (value ? Date.parse(value) : NaN))
+            .filter(Number.isFinite);
+        const sessionAt = new Date(sessionTimes.length ? Math.min(...sessionTimes) : Date.now()).toISOString();
 
         let insertedCount = 0;
         for (const row of recordsToPersist) {
@@ -2687,10 +2850,12 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
                         left_at = COALESCE($2, left_at),
                         status = COALESCE($3, status),
                         class_name = COALESCE($4, class_name),
+                        session_id = COALESCE(session_id, $6),
+                        session_at = COALESCE(session_at, $7),
                         updated_at = NOW()
                     WHERE id = $5
                     `,
-                    [row.joinedAt, row.leftAt, row.status, persistedClassName, existing.rows[0].id]
+                    [row.joinedAt, row.leftAt, row.status, persistedClassName, existing.rows[0].id, sessionId, sessionAt]
                 );
             } else {
                 insertedCount += 1;
@@ -2704,12 +2869,14 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
                         class_name,
                         joined_at,
                         left_at,
+                        session_id,
+                        session_at,
                         created_at,
                         updated_at
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
                     `,
-                    [classIdNum, row.studentId, row.sessionKey, row.status, persistedClassName, row.joinedAt, row.leftAt]
+                    [classIdNum, row.studentId, row.sessionKey, row.status, persistedClassName, row.joinedAt, row.leftAt, sessionId, sessionAt]
                 );
             }
         }
@@ -2813,6 +2980,7 @@ app.get("/attendance/timestamps", requireTeacherAuth, requireOwnedClass, async (
             FROM attendance_timestamps at
             JOIN students s ON at.student_id = s.id
             WHERE at.class_id = $1
+              AND (at.joined_at IS NOT NULL OR at.left_at IS NOT NULL)
             ORDER BY at.joined_at DESC
         `, [classIdNum]);
 
@@ -2881,6 +3049,7 @@ app.get("/attendance/history", requireTeacherAuth, requireOwnedClass, async (req
             FROM attendance_timestamps at
             JOIN students s ON s.id = at.student_id
             WHERE at.class_id = $1 AND at.student_id = $2
+              AND (at.joined_at IS NOT NULL OR at.left_at IS NOT NULL)
             ORDER BY at.joined_at DESC
             `,
             [classIdNum, resolvedStudentId]
