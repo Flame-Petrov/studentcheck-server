@@ -1,7 +1,10 @@
 const express = require("express");
 
-const createBillingRouter = (stripeService) => {
+const createBillingRouter = (stripeService, requireTeacherAuth) => {
     const router = express.Router();
+    // Identity comes from the verified teacher JWT. It used to come from the
+    // x-org-id / x-user-role headers, which any caller could set to any value.
+    const requireAuth = [requireTeacherAuth, attachBillingAccount];
 
     router.get("/status", requireAuth, async (req, res) => {
         try {
@@ -51,15 +54,14 @@ const createBillingWebhookHandler = (stripeService) => {
     };
 };
 
-const requireAuth = (req, res, next) => {
-    const orgId = Number(req.headers["x-org-id"]);
-    const role = String(req.headers["x-user-role"] || "").toLowerCase();
-
+// Each teacher is their own billing account and manages it.
+const attachBillingAccount = (req, res, next) => {
+    const orgId = Number(req.authTeacherId);
     if (!Number.isFinite(orgId) || orgId <= 0) {
         return res.status(401).send({ error: "Unauthorized" });
     }
 
-    req.auth = { orgId, role };
+    req.auth = { orgId, role: "owner" };
     return next();
 };
 

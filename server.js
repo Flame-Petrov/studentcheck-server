@@ -57,6 +57,21 @@ if (!JWT_SECRET) {
 
 const app = express();
 
+// Express 4 does not catch rejected promises from async route handlers: an
+// unexpected DB error in a route without its own try/catch crashed the whole
+// process. Route those rejections to the error handler registered before listen().
+for (const method of ["get", "post", "put", "delete", "patch"]) {
+    const register = app[method].bind(app);
+    app[method] = (path, ...handlers) => {
+        if (handlers.length === 0) return register(path); // app.get("setting")
+        return register(path, ...handlers.map((handler) =>
+            typeof handler === "function" && handler.length < 4
+                ? (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next)
+                : handler
+        ));
+    };
+}
+
 // ----------------- Structured Logging Helpers -----------------
 const rawInfo = console.info.bind(console);
 const rawWarn = console.warn.bind(console);
@@ -591,7 +606,6 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: "32kb" }));
-app.use("/api/billing", createBillingRouter(stripeService));
 
 const createRouteRateLimiter = ({ windowMs, maxRequests }) => {
     const hits = new Map();
@@ -745,6 +759,36 @@ const requireTeacherAuth = async (req, res, next) => {
     });
     next();
 };
+
+// Mounted here (not next to express.json) because it needs requireTeacherAuth.
+app.use("/api/billing", createBillingRouter(stripeService, requireTeacherAuth));
+
+// Use after requireTeacherAuth on routes that take a class_id (body or query):
+// rejects classes that belong to another teacher. A missing/invalid class_id is
+// left to the route's own 400 handling.
+const requireOwnedClass = async (req, res, next) => {
+    const rawClassId = req.body?.class_id ?? req.query?.class_id;
+    const classId = Number.parseInt(String(rawClassId ?? ""), 10);
+    if (!Number.isInteger(classId) || classId <= 0) return next();
+    try {
+        const result = await pool.query("SELECT teacher_id FROM classes WHERE id = $1", [classId]);
+        if (result.rows.length === 0) {
+            return res.status(404).send({ error: "Class not found" });
+        }
+        if (Number(result.rows[0].teacher_id) !== Number(req.authTeacherId)) {
+            return res.status(403).send({ error: "Class does not belong to authenticated teacher" });
+        }
+        return next();
+    } catch (error) {
+        logRouteError(req, "CLASS_OWNERSHIP_CHECK_ERROR", error);
+        return res.status(500).send({ error: "Internal server error" });
+    }
+};
+
+// GET /classes?class_id= stays public (the student page reads class names with it);
+// listing classes requires a teacher login.
+const requireTeacherAuthUnlessClassId = (req, res, next) =>
+    req.query?.class_id !== undefined ? next() : requireTeacherAuth(req, res, next);
 
 const getLoginAttemptKey = (req, identifier) => `${req.ip}|${req.path}|${String(identifier || "").slice(0, 256)}`;
 const getRetryDelayMs = (fails) => Math.min(15000, fails * 750);
@@ -1926,7 +1970,7 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
 
 
 
-app.get("/students", async (req, res) => {
+app.get("/students", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
     const {
@@ -2006,10 +2050,10 @@ app.post("/classes", requireTeacherAuth, async (req, res) => {
     }
 });
 
-// (Optional helper) List classes for a teacher by email query param: /classes?teacherEmail=...
-app.get("/classes", async (req, res) => {
+// GET /classes?class_id=N returns one class (public); GET /classes lists the logged-in teacher's classes.
+app.get("/classes", requireTeacherAuthUnlessClassId, async (req, res) => {
     logRequestStart(req);
-    const { teacherEmail, class_id } = req.query;
+    const { class_id } = req.query;
     try {
         const requestedClassIdRaw = class_id;
         if (requestedClassIdRaw !== undefined) {
@@ -2042,14 +2086,10 @@ app.get("/classes", async (req, res) => {
             });
         }
 
-        if (teacherEmail) {
-            const teacherEmailNorm = normalize(teacherEmail);
-            const teacherEmailHash = hashForLookup(teacherEmailNorm);
-            const t = await pool.query("SELECT id FROM teachers WHERE email_hash = $1", [teacherEmailHash]);
-            if (t.rows.length === 0) {
-                return res.status(404).send({ error: "Teacher not found" });
-            }
-            const teacherId = t.rows[0].id;
+        // Always list the logged-in teacher's own classes; the teacherEmail
+        // query param is ignored so nobody can list another teacher's classes.
+        {
+            const teacherId = req.authTeacherId;
 
             const classes = await pool.query(
                 `
@@ -2066,19 +2106,6 @@ app.get("/classes", async (req, res) => {
             );
             
             return res.send({ message: "Classes fetched", classes: classes.rows });
-        } else {
-            const classes = await pool.query(
-                `
-                SELECT
-                    id,
-                    teacher_id,
-                    name,
-                    COALESCE(completed_classes_count, 0) AS completed_classes_count
-                FROM classes
-                ORDER BY id DESC
-                `
-            );
-            return res.send({ message: "All classes fetched", classes: classes.rows });
         }
     } catch (error) {
         logRouteError(req, "CLASSES_FETCH_ERROR", error);
@@ -2204,7 +2231,7 @@ app.post("/class_students", requireTeacherAuth, async (req, res) => {
 
 
 
-app.get("/class_students", async (req, res) => {
+app.get("/class_students", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
     const classId = req.query.class_id;
     if (!classId) {
@@ -2346,7 +2373,7 @@ app.get("/get_class_id_by_name", async (req, res) => {
 
 // ----------------- Attendance Recording Endpoint -----------------
 // Accepts body: { class_id, student_ids } or { class_id, student_id } or { class_id, faculty_number }
-app.post("/attendance", async (req, res) => {
+app.post("/attendance", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
     
     const { class_id, student_ids, student_id, faculty_number } = req.body || {};
@@ -2442,7 +2469,7 @@ app.post("/attendance", async (req, res) => {
 //   class_name?: string,
 //   records: [{ student_id?, faculty_number?, status?, joined_at?, left_at? }]
 // }
-app.post("/attendance/finish", async (req, res) => {
+app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
 
     const { class_id, class_name, records } = req.body || {};
@@ -2713,7 +2740,7 @@ app.post("/attendance/finish", async (req, res) => {
 });
 
 // List attendance entries optionally filtered by classId: /attendance?classId=...
-app.get("/attendance", async (req, res) => {
+app.get("/attendance", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
     
     const classId = req.query.class_id;
@@ -2754,7 +2781,7 @@ app.get("/attendance", async (req, res) => {
 
 // ----------------- Attendance Timestamps Endpoint -----------------
 // Query: /attendance/timestamps?class_id=...
-app.get("/attendance/timestamps", async (req, res) => {
+app.get("/attendance/timestamps", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
 
     const classId = req.query.class_id;
@@ -2799,7 +2826,7 @@ app.get("/attendance/timestamps", async (req, res) => {
 
 // ----------------- Attendance History Endpoint -----------------
 // Query: /attendance/history?class_id=...&student_id=...&faculty_number=...
-app.get("/attendance/history", async (req, res) => {
+app.get("/attendance/history", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
 
     const { class_id, student_id, faculty_number } = req.query || {};
@@ -3031,7 +3058,7 @@ app.all("/heartbeat", (req, res) => {
 
 
 
-app.post("/save_student_timestamps", async (req, res) => {
+app.post("/save_student_timestamps", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
 
     const classIdNum = parsePositiveInteger(req.body.class_id);
@@ -3171,7 +3198,7 @@ app.post("/save_student_timestamps", async (req, res) => {
 
 
 
-app.get("/get_student_attendance_count", async (req, res) => {
+app.get("/get_student_attendance_count", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
 
     var classId = req.query.class_id;
@@ -3291,7 +3318,7 @@ App context:
 ${APP_RESUME_CONTENT}
 `;
 
-app.post("/support/chat", async (req, res) => {
+app.post("/support/chat", requireTeacherAuth, async (req, res) => {
     logRequestStart(req, {includeBody: false});
 
     const { message, history, language } = req.body || {};
@@ -3425,6 +3452,12 @@ app.post("/backup/drop-encryption-columns", dropEncryptionColumns);
 
 // ----------------- Database Backup Import Endpoint -----------------
 app.post("/backup/import", importBackup);
+
+app.use((err, req, res, next) => {
+    logRouteError(req, "UNHANDLED_ROUTE_ERROR", err);
+    if (res.headersSent) return next(err);
+    return res.status(500).send({ error: "Internal server error" });
+});
 
 app.listen(PORT, () => {
     emitLog("info", "SERVER_LISTENING", {

@@ -130,7 +130,12 @@ const normalizeInsertValue = (value) => {
 
 const validateBackupKey = (req, res) => {
     const configuredBackupKey = String(process.env.BACKUP_API_KEY || "");
-    if (!configuredBackupKey) return true;
+    // Fail closed: with no key configured these endpoints would expose (and
+    // let anyone overwrite) the whole database.
+    if (!configuredBackupKey) {
+        res.status(503).send({ error: "Backup endpoints are disabled: BACKUP_API_KEY is not set" });
+        return false;
+    }
 
     const providedBackupKey = String(req.headers["x-backup-key"] || "");
     if (!providedBackupKey || providedBackupKey !== configuredBackupKey) {

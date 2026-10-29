@@ -136,9 +136,13 @@ const createStripeService = ({ stripe, db, appUrl, priceIdToPlan = DEFAULT_PLAN_
 };
 
 const getSafeReturnUrl = (returnUrl, appUrl) => {
-    if (returnUrl && appUrl && returnUrl.startsWith(appUrl)) {
-        return returnUrl;
-    }
+    // Compare origins, not string prefixes: "https://app.example.com.evil.com"
+    // starts with "https://app.example.com" but is a different site.
+    try {
+        if (returnUrl && appUrl && new URL(returnUrl).origin === new URL(appUrl).origin) {
+            return returnUrl;
+        }
+    } catch (_) {}
     if (appUrl) return appUrl;
     return "http://localhost:3000";
 };
