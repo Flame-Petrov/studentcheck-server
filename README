@@ -14,4 +14,6 @@ psql {External Database URL}
 
 SELECT * FROM {table name}
 
-postgresql://USER:***REMOVED***@HOST/DATABASE
+- The External Database URL is in your database provider's dashboard.
+  Keep it in the DATABASE_URL environment variable; never commit it. Example:
+psql "$DATABASE_URL"
