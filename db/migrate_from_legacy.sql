@@ -10,6 +10,10 @@
 -- Rules
 --   * Student and class ids are kept, so saved links and student tokens still
 --     point at the same records. Teachers get new user ids after the students.
+--   * Emails come from the old "email" column (encrypted once). For many rows
+--     the old "email_encrypted" column held that value encrypted a second time.
+--     Some old email_hash values do not match the email; the server repairs
+--     them at the next login.
 --   * Old passwords that are not argon2 yet are stored as
 --     "legacy-v1:<lookup hash>:<encrypted password>"; the server checks them the
 --     old way and replaces them with argon2 at the next login.
@@ -51,7 +55,7 @@ SELECT
     s.id,
     'student',
     btrim(s.full_name),
-    COALESCE(s.email_encrypted, s.email),
+    COALESCE(s.email, s.email_encrypted),
     s.email_hash,
     CASE
         WHEN s.password_hash LIKE '$argon2%' THEN s.password_hash
@@ -69,7 +73,7 @@ SELECT
     m.new_id,
     'teacher',
     btrim(t.full_name),
-    COALESCE(t.email_encrypted, t.email),
+    COALESCE(t.email, t.email_encrypted),
     t.email_hash,
     CASE
         WHEN t.password_hash LIKE '$argon2%' THEN t.password_hash

@@ -1129,6 +1129,19 @@ const buildAttendanceStudentResolver = (client) => {
     };
 };
 
+// Some accounts migrated from the old database carry an email_hash that does not
+// match their email. A successful login stores the right one.
+const repairEmailHash = async (req, userId, storedHash, expectedHash) => {
+    if (!expectedHash || storedHash === expectedHash) return;
+    try {
+        await pool.query("UPDATE users SET email_hash = $1 WHERE id = $2", [expectedHash, userId]);
+        logRouteStep(req, "EMAIL_HASH_REPAIRED", { userId: Number(userId) });
+    } catch (error) {
+        // Another account already has this hash; keep the login working and leave it for review.
+        logRouteError(req, "EMAIL_HASH_REPAIR_FAILED", error, { userId: Number(userId) });
+    }
+};
+
 // Replaces an old-format password with argon2 after a successful login.
 const upgradePasswordHash = async (userId, plainPassword) => {
     await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [await hashPassword(plainPassword), userId]);
@@ -1162,13 +1175,21 @@ app.post("/teacherLogin", async (req, res) => {
 
         const { rows } = await pool.query(
             `
-            SELECT id, full_name, email_encrypted, password_hash
+            SELECT id, full_name, email_encrypted, email_hash, password_hash
             FROM users
             WHERE email_hash = $1 AND role = 'teacher'
             `,
             [emailHash]
         );
-        const teacher = rows[0] || null;
+        let teacher = rows[0] || null;
+        if (!teacher) {
+            // The stored hash can be wrong for migrated accounts (see repairEmailHash).
+            // There are few teachers, so compare their decrypted emails instead.
+            const { rows: teacherRows } = await pool.query(
+                "SELECT id, full_name, email_encrypted, email_hash, password_hash FROM users WHERE role = 'teacher'"
+            );
+            teacher = teacherRows.find((row) => getResolvedEmailForResponse(row) === emailNorm) || null;
+        }
         const passwordCheck = teacher ? await verifyLoginPassword(password, teacher.password_hash) : null;
 
         if (!teacher || !passwordCheck.isValid) {
@@ -1182,6 +1203,7 @@ app.post("/teacherLogin", async (req, res) => {
         if (passwordCheck.needsMigration) {
             await upgradePasswordHash(teacher.id, password);
         }
+        await repairEmailHash(req, teacher.id, teacher.email_hash, emailHash);
 
         const resolvedEmail = getResolvedEmailForResponse(teacher);
         const tokenPayload = issueTeacherToken({
@@ -1229,7 +1251,7 @@ app.post("/studentLogin", async (req, res) => {
 
         const { rows } = await pool.query(
             `
-            SELECT ${STUDENT_PROFILE_COLUMNS_SQL}, u.password_hash
+            SELECT ${STUDENT_PROFILE_COLUMNS_SQL}, u.email_hash, u.password_hash
             FROM students st
             ${STUDENT_PROFILE_JOINS_SQL}
             WHERE st.faculty_number_hash = $1
@@ -1250,6 +1272,8 @@ app.post("/studentLogin", async (req, res) => {
         if (passwordCheck.needsMigration) {
             await upgradePasswordHash(studentRow.id, password);
         }
+        const studentEmail = getResolvedEmailForResponse(studentRow);
+        await repairEmailHash(req, studentRow.id, studentRow.email_hash, studentEmail ? hashForLookup(studentEmail) : null);
 
         const student = withStudentResponseIdentifiers(studentRow, { endpoint: "POST /studentLogin" });
         const studentToken = issueStudentToken({ studentId: studentRow.id });
