@@ -1,27 +1,11 @@
+// Billing storage. The billing "org" is the teacher: orgId is the teacher's user id.
 const createDbAdapter = (pool) => {
-    const ensureBillingTables = async () => {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS org_billing (
-                org_id INTEGER PRIMARY KEY,
-                stripe_customer_id TEXT UNIQUE,
-                stripe_subscription_id TEXT,
-                plan TEXT,
-                subscription_status TEXT,
-                current_period_end TIMESTAMPTZ
-            );
-            CREATE TABLE IF NOT EXISTS stripe_events (
-                event_id TEXT PRIMARY KEY,
-                processed_at TIMESTAMPTZ DEFAULT NOW()
-            );
-        `);
-    };
-
     const getBillingStatusByOrgId = async (orgId) => {
         const { rows } = await pool.query(
             `
             SELECT plan, subscription_status, current_period_end, stripe_customer_id, stripe_subscription_id
-            FROM org_billing
-            WHERE org_id = $1
+            FROM billing_accounts
+            WHERE teacher_id = $1
             `,
             [orgId]
         );
@@ -40,20 +24,21 @@ const createDbAdapter = (pool) => {
 
         await pool.query(
             `
-            INSERT INTO org_billing (
-                org_id,
+            INSERT INTO billing_accounts (
+                teacher_id,
                 stripe_customer_id,
                 stripe_subscription_id,
                 plan,
                 subscription_status,
                 current_period_end
             ) VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (org_id) DO UPDATE SET
-                stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, org_billing.stripe_customer_id),
-                stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, org_billing.stripe_subscription_id),
-                plan = COALESCE(EXCLUDED.plan, org_billing.plan),
-                subscription_status = COALESCE(EXCLUDED.subscription_status, org_billing.subscription_status),
-                current_period_end = COALESCE(EXCLUDED.current_period_end, org_billing.current_period_end)
+            ON CONFLICT (teacher_id) DO UPDATE SET
+                stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, billing_accounts.stripe_customer_id),
+                stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, billing_accounts.stripe_subscription_id),
+                plan = COALESCE(EXCLUDED.plan, billing_accounts.plan),
+                subscription_status = COALESCE(EXCLUDED.subscription_status, billing_accounts.subscription_status),
+                current_period_end = COALESCE(EXCLUDED.current_period_end, billing_accounts.current_period_end),
+                updated_at = NOW()
             `,
             values
         );
@@ -61,10 +46,10 @@ const createDbAdapter = (pool) => {
 
     const getOrgIdByCustomerId = async (customerId) => {
         const { rows } = await pool.query(
-            "SELECT org_id FROM org_billing WHERE stripe_customer_id = $1",
+            "SELECT teacher_id FROM billing_accounts WHERE stripe_customer_id = $1",
             [customerId]
         );
-        return rows[0]?.org_id || null;
+        return rows[0]?.teacher_id || null;
     };
 
     const isStripeEventProcessed = async (eventId) => {
@@ -83,7 +68,6 @@ const createDbAdapter = (pool) => {
     };
 
     return {
-        ensureBillingTables,
         getBillingStatusByOrgId,
         upsertBillingForOrg,
         getOrgIdByCustomerId,

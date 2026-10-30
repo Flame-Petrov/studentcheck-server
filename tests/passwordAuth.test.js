@@ -2,9 +2,10 @@ const assert = require("node:assert/strict");
 const crypto = require("crypto");
 
 const {
-    ARGON2_ALGORITHM,
-    buildArgon2PasswordFields,
+    LEGACY_PASSWORD_PREFIX,
+    hashPassword,
     verifyPasswordWithMigration,
+    verifyStoredPassword,
 } = require("../security/passwordAuth");
 
 process.env.AUTH_PEPPER = process.env.AUTH_PEPPER || "test-pepper-value";
@@ -27,13 +28,13 @@ const run = async (name, fn) => {
 const main = async () => {
     await run("valid plaintext password succeeds for argon2id hash", async () => {
         const plainPassword = "CorrectHorseBatteryStaple!";
-        const fields = await buildArgon2PasswordFields(plainPassword);
+        const passwordHash = await hashPassword(plainPassword);
 
         const result = await verifyPasswordWithMigration({
             inputPassword: plainPassword,
-            rowPassword: fields.password,
-            rowPasswordHash: fields.password_hash,
-            rowHashAlgorithm: fields.hash_algorithm,
+            rowPassword: null,
+            rowPasswordHash: passwordHash,
+            rowHashAlgorithm: null,
             legacyHashVerifier,
             legacyDecryptor: () => null,
         });
@@ -45,13 +46,13 @@ const main = async () => {
 
     await run("using stored hash string as password fails", async () => {
         const plainPassword = "Pa$$w0rd123";
-        const fields = await buildArgon2PasswordFields(plainPassword);
+        const passwordHash = await hashPassword(plainPassword);
 
         const result = await verifyPasswordWithMigration({
-            inputPassword: fields.password_hash,
-            rowPassword: fields.password,
-            rowPasswordHash: fields.password_hash,
-            rowHashAlgorithm: fields.hash_algorithm,
+            inputPassword: passwordHash,
+            rowPassword: null,
+            rowPasswordHash: passwordHash,
+            rowHashAlgorithm: null,
             legacyHashVerifier,
             legacyDecryptor: () => null,
         });
@@ -78,15 +79,15 @@ const main = async () => {
         assert.equal(legacyCheck.needsMigration, true);
         assert.equal(legacyCheck.matchedWith, "legacy");
 
-        const upgraded = await buildArgon2PasswordFields(legacyPassword);
-        assert.equal(upgraded.hash_algorithm, ARGON2_ALGORITHM);
-        assert.notEqual(upgraded.password_hash, legacyHash);
+        const upgraded = await hashPassword(legacyPassword);
+        assert.ok(upgraded.startsWith("$argon2id$"));
+        assert.notEqual(upgraded, legacyHash);
 
         const upgradedCheck = await verifyPasswordWithMigration({
             inputPassword: legacyPassword,
-            rowPassword: upgraded.password,
-            rowPasswordHash: upgraded.password_hash,
-            rowHashAlgorithm: upgraded.hash_algorithm,
+            rowPassword: null,
+            rowPasswordHash: upgraded,
+            rowHashAlgorithm: null,
             legacyHashVerifier,
             legacyDecryptor: () => null,
         });
@@ -96,15 +97,51 @@ const main = async () => {
         assert.equal(upgradedCheck.matchedWith, "argon2id");
     });
 
-    await run("registration password fields store hash metadata and no plaintext", async () => {
+    await run("hashPassword stores an argon2id hash, never the plaintext", async () => {
         const plainPassword = "RegPassword!55";
-        const fields = await buildArgon2PasswordFields(plainPassword);
+        const passwordHash = await hashPassword(plainPassword);
 
-        assert.equal(fields.password, null);
-        assert.equal(fields.hash_algorithm, ARGON2_ALGORITHM);
-        assert.ok(fields.password_updated_at instanceof Date);
-        assert.ok(typeof fields.password_hash === "string" && fields.password_hash.length > 0);
-        assert.notEqual(fields.password_hash, plainPassword);
+        assert.ok(passwordHash.startsWith("$argon2id$"));
+        assert.equal(passwordHash.includes(plainPassword), false);
+    });
+
+    await run("stored argon2 hash verifies without migration", async () => {
+        const plainPassword = "StoredArgon!1";
+        const storedHash = await hashPassword(plainPassword);
+
+        const ok = await verifyStoredPassword({ inputPassword: plainPassword, storedHash, legacyHashVerifier, legacyDecryptor: () => null });
+        assert.deepEqual([ok.isValid, ok.needsMigration], [true, false]);
+
+        const wrong = await verifyStoredPassword({ inputPassword: "nope", storedHash, legacyHashVerifier, legacyDecryptor: () => null });
+        assert.equal(wrong.isValid, false);
+    });
+
+    await run("legacy-v1 value verifies by lookup hash and asks for migration", async () => {
+        const plainPassword = "OldLookup!7";
+        const storedHash = `${LEGACY_PASSWORD_PREFIX}${legacyHashVerifier(plainPassword)}:c29tZS1jaXBoZXJ0ZXh0`;
+
+        const ok = await verifyStoredPassword({ inputPassword: plainPassword, storedHash, legacyHashVerifier, legacyDecryptor: () => null });
+        assert.deepEqual([ok.isValid, ok.needsMigration], [true, true]);
+
+        const wrong = await verifyStoredPassword({ inputPassword: "OldLookup!8", storedHash, legacyHashVerifier, legacyDecryptor: () => null });
+        assert.equal(wrong.isValid, false);
+    });
+
+    await run("legacy-v1 value verifies by decrypting the old password", async () => {
+        const plainPassword = "OldEncrypted:with:colons";
+        const storedHash = `${LEGACY_PASSWORD_PREFIX}:ENC(${plainPassword})`;
+        const legacyDecryptor = (value) => (value.startsWith("ENC(") ? value.slice(4, -1) : null);
+
+        const ok = await verifyStoredPassword({ inputPassword: plainPassword, storedHash, legacyHashVerifier, legacyDecryptor });
+        assert.deepEqual([ok.isValid, ok.needsMigration], [true, true]);
+
+        const wrong = await verifyStoredPassword({ inputPassword: "OldEncrypted", storedHash, legacyHashVerifier, legacyDecryptor });
+        assert.equal(wrong.isValid, false);
+    });
+
+    await run("empty legacy-v1 value never verifies", async () => {
+        const result = await verifyStoredPassword({ inputPassword: "anything", storedHash: `${LEGACY_PASSWORD_PREFIX}:`, legacyHashVerifier, legacyDecryptor: () => null });
+        assert.equal(result.isValid, false);
     });
 
 };

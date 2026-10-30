@@ -36,11 +36,11 @@ const createRes = () => {
 const makeHandler = ({ classesById = {}, teacherByEmail = {}, addStudentsToClass } = {}) => {
     const pool = {
         async query(sql, values) {
-            if (sql.includes("FROM teachers WHERE email_hash")) {
+            if (sql.includes("FROM users WHERE email_hash")) {
                 const id = teacherByEmail[values[0]];
                 return { rows: id ? [{ id }] : [] };
             }
-            if (sql.includes("FROM classes WHERE id = $1")) {
+            if (sql.includes("FROM courses WHERE id = $1")) {
                 const cls = classesById[Number(values[0])];
                 return { rows: cls ? [{ id: cls.id, teacher_id: cls.teacher_id }] : [] };
             }

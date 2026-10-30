@@ -14,11 +14,7 @@ const { createBackupHandlers } = require("./backupService");
 const { createBillingRouter, createBillingWebhookHandler } = require("./billingRoutes");
 const { encryptRaw, decrypt, hashForLookup, hashExactForLookup, normalize } = require("./security/cryptoService");
 const { resolveEmailForApi, serializeStudent } = require("./security/decryptors");
-const {
-    ARGON2_ALGORITHM,
-    buildArgon2PasswordFields,
-    verifyPasswordWithMigration,
-} = require("./security/passwordAuth");
+const { hashPassword, verifyStoredPassword } = require("./security/passwordAuth");
 const {
     normalizeEmailInput,
     normalizeFacultyNumberInput,
@@ -497,7 +493,7 @@ const addStudentsToClass = async (classId, students) => {
     const hashes = Array.from(new Set(Array.from(normalizedToHash.values())));
     const placeholders = hashes.map((_, i) => `$${i + 1}`).join(",");
 
-    const selectSql = `SELECT id, faculty_number_hash FROM students WHERE faculty_number_hash IN (${placeholders})`;
+    const selectSql = `SELECT user_id AS id, faculty_number_hash FROM students WHERE faculty_number_hash IN (${placeholders})`;
 
     const result = await pool.query(selectSql, hashes);
 
@@ -506,7 +502,7 @@ const addStudentsToClass = async (classId, students) => {
         idMap[row.id] = row.faculty_number_hash;
     });
 
-    const insertSql = "INSERT INTO class_students (class_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
+    const insertSql = "INSERT INTO course_enrollments (course_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
     const studentIds = Object.keys(idMap);
 
     const client = await pool.connect();
@@ -557,9 +553,8 @@ app.use((req, res, next) => {
 });
 
 // connect to PostgreSQL
-// DATABASE_URL must be the direct Supabase connection (port 5432), NOT the PgBouncer
-// pooler URL (port 6543). PgBouncer's transaction mode does not support the DDL
-// statements (ALTER TABLE, CREATE INDEX …) that run during server startup.
+// DATABASE_URL should be the direct Supabase connection (port 5432). The schema is
+// created from db/schema.sql; the server only checks at startup that it exists.
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: {
@@ -738,7 +733,7 @@ const requireTeacherAuth = async (req, res, next) => {
         return res.status(401).send({ error: "Invalid or expired token" });
     }
 
-    const teacherResult = await pool.query("SELECT id, email_hash FROM teachers WHERE id = $1", [teacherId]);
+    const teacherResult = await pool.query("SELECT id, email_hash FROM users WHERE id = $1 AND role = 'teacher'", [teacherId]);
     if (!teacherResult.rows.length) {
         logAuthEvent({
             requestId,
@@ -793,7 +788,7 @@ const requireOwnedClass = async (req, res, next) => {
     const classId = Number.parseInt(String(rawClassId ?? ""), 10);
     if (!Number.isInteger(classId) || classId <= 0) return next();
     try {
-        const result = await pool.query("SELECT teacher_id FROM classes WHERE id = $1", [classId]);
+        const result = await pool.query("SELECT teacher_id FROM courses WHERE id = $1", [classId]);
         if (result.rows.length === 0) {
             return res.status(404).send({ error: "Class not found" });
         }
@@ -825,18 +820,13 @@ const requireStudentAuth = async (req, res, next) => {
     if (!Number.isInteger(studentId) || studentId <= 0) {
         return res.status(401).send({ error: "Invalid or expired token" });
     }
-    const result = await pool.query("SELECT id FROM students WHERE id = $1", [studentId]);
+    const result = await pool.query("SELECT user_id FROM students WHERE user_id = $1", [studentId]);
     if (!result.rows.length) {
         return res.status(401).send({ error: "Invalid or expired token" });
     }
     req.authStudentId = studentId;
     return next();
 };
-
-// GET /classes?class_id= stays public (the student page reads class names with it);
-// listing classes requires a teacher login.
-const requireTeacherAuthUnlessClassId = (req, res, next) =>
-    req.query?.class_id !== undefined ? next() : requireTeacherAuth(req, res, next);
 
 const getLoginAttemptKey = (req, identifier) => `${req.ip}|${req.path}|${String(identifier || "").slice(0, 256)}`;
 const getRetryDelayMs = (fails) => Math.min(15000, fails * 750);
@@ -863,238 +853,6 @@ const clearLoginFailures = (key) => {
     loginAttemptState.delete(key);
 };
 
-// Flag-controlled migration/backfill for encrypted/hash fields on sensitive columns
-const APPLY_ENCRYPTION_MIGRATION =
-    String(process.env.APPLY_ENCRYPTION_MIGRATION || "").toLowerCase() === "true";
-const APPLY_ENCRYPTION_BACKFILL =
-    String(process.env.APPLY_ENCRYPTION_BACKFILL || "").toLowerCase() === "true";
-
-const applyEncryptionMigration = async (client) => {
-    await client.query(`
-        ALTER TABLE students
-          ADD COLUMN IF NOT EXISTS email_encrypted TEXT,
-          ADD COLUMN IF NOT EXISTS email_hash TEXT,
-          ADD COLUMN IF NOT EXISTS faculty_number_encrypted TEXT,
-          ADD COLUMN IF NOT EXISTS faculty_number_hash TEXT,
-          ADD COLUMN IF NOT EXISTS password_hash TEXT,
-          ADD COLUMN IF NOT EXISTS hash_algorithm TEXT,
-          ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ;
-
-        ALTER TABLE teachers
-          ADD COLUMN IF NOT EXISTS email_encrypted TEXT,
-          ADD COLUMN IF NOT EXISTS email_hash TEXT,
-          ADD COLUMN IF NOT EXISTS password_hash TEXT,
-          ADD COLUMN IF NOT EXISTS hash_algorithm TEXT,
-          ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ;
-
-        ALTER TABLE students ALTER COLUMN password DROP NOT NULL;
-        ALTER TABLE teachers ALTER COLUMN password DROP NOT NULL;
-
-        CREATE INDEX IF NOT EXISTS idx_students_email_hash ON students (email_hash);
-        CREATE INDEX IF NOT EXISTS idx_students_faculty_number_hash ON students (faculty_number_hash);
-        CREATE INDEX IF NOT EXISTS idx_teachers_email_hash ON teachers (email_hash);
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_students_email_hash ON students (email_hash) WHERE email_hash IS NOT NULL;
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_students_faculty_number_hash ON students (faculty_number_hash) WHERE faculty_number_hash IS NOT NULL;
-
-        ALTER TABLE students DROP CONSTRAINT IF EXISTS students_group_check;
-        ALTER TABLE students
-            ADD CONSTRAINT students_group_check
-            CHECK ("group" ~ '^[0-9]+$' AND "group"::integer BETWEEN 30 AND 50);
-    `);
-};
-
-const applyAttendanceSchemaMigration = async (client) => {
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS attendance_timestamps (
-            id SERIAL PRIMARY KEY,
-            class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
-            student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-            joined_at TIMESTAMPTZ,
-            left_at TIMESTAMPTZ
-        );
-
-        ALTER TABLE attendances
-            ADD COLUMN IF NOT EXISTS count INTEGER;
-        UPDATE attendances
-        SET count = 0
-        WHERE count IS NULL;
-        ALTER TABLE attendances
-            ALTER COLUMN count SET DEFAULT 0;
-        ALTER TABLE attendances
-            ALTER COLUMN count SET NOT NULL;
-
-        ALTER TABLE attendances
-            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
-        UPDATE attendances
-        SET updated_at = NOW()
-        WHERE updated_at IS NULL;
-
-        ALTER TABLE attendance_timestamps
-            ADD COLUMN IF NOT EXISTS session_key TEXT,
-            ADD COLUMN IF NOT EXISTS status TEXT,
-            ADD COLUMN IF NOT EXISTS class_name TEXT,
-            ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ,
-            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
-
-        UPDATE attendance_timestamps
-        SET
-            created_at = COALESCE(created_at, NOW()),
-            updated_at = COALESCE(updated_at, NOW());
-
-        UPDATE attendance_timestamps
-        SET session_key = md5(
-            COALESCE(class_id::text, '') || ':' ||
-            COALESCE(student_id::text, '') || ':' ||
-            COALESCE(joined_at::text, left_at::text, '')
-        )
-        WHERE session_key IS NULL;
-
-        ALTER TABLE attendance_timestamps
-            ALTER COLUMN created_at SET DEFAULT NOW();
-        ALTER TABLE attendance_timestamps
-            ALTER COLUMN created_at SET NOT NULL;
-        ALTER TABLE attendance_timestamps
-            ALTER COLUMN updated_at SET DEFAULT NOW();
-        ALTER TABLE attendance_timestamps
-            ALTER COLUMN updated_at SET NOT NULL;
-        ALTER TABLE attendance_timestamps
-            ALTER COLUMN session_key SET NOT NULL;
-
-        -- Lesson identity shared by every row saved from one attendance session,
-        -- so absences (rows without timestamps) can be placed on a lesson date.
-        ALTER TABLE attendance_timestamps
-            ADD COLUMN IF NOT EXISTS session_id TEXT,
-            ADD COLUMN IF NOT EXISTS session_at TIMESTAMPTZ;
-
-        CREATE INDEX IF NOT EXISTS idx_attendance_timestamps_class_student
-            ON attendance_timestamps (class_id, student_id);
-        CREATE INDEX IF NOT EXISTS idx_attendance_timestamps_class_student_session_key
-            ON attendance_timestamps (class_id, student_id, session_key);
-        CREATE INDEX IF NOT EXISTS idx_attendance_timestamps_class_joined_left
-            ON attendance_timestamps (class_id, joined_at, left_at);
-    `);
-};
-
-const getPlainTextFromPossiblyEncrypted = (value) => {
-    const raw = String(value || "");
-    if (!raw) return { plainText: "", wasEncrypted: false };
-
-    try {
-        return {
-            plainText: decrypt(raw),
-            wasEncrypted: true,
-        };
-    } catch {
-        return {
-            plainText: raw,
-            wasEncrypted: false,
-        };
-    }
-};
-
-const backfillEncryptionForExistingData = async (client) => {
-
-    const { rows: studentRows } = await client.query(`
-        SELECT
-            id,
-            email,
-            email_encrypted,
-            email_hash,
-            faculty_number,
-            faculty_number_encrypted,
-            faculty_number_hash
-        FROM students
-        WHERE email IS NOT NULL
-           OR faculty_number IS NOT NULL
-    `);
-
-    let studentsUpdated = 0;
-    for (const row of studentRows) {
-        const updates = {};
-
-        if (row.email) {
-            const { plainText: emailPlain, wasEncrypted: emailWasEncrypted } =
-                getPlainTextFromPossiblyEncrypted(row.email);
-            const emailNorm = normalize(emailPlain);
-            if (emailNorm && (!row.email_hash || !row.email_encrypted || !emailWasEncrypted)) {
-                const emailEncrypted = encryptRaw(emailNorm);
-                updates.email = emailEncrypted;
-                updates.email_encrypted = emailEncrypted;
-                updates.email_hash = hashForLookup(emailNorm);
-            }
-        }
-
-        if (row.faculty_number) {
-            const { plainText: facultyPlain } = getPlainTextFromPossiblyEncrypted(row.faculty_number);
-            const facultyNorm = normalize(facultyPlain);
-            if (facultyNorm && (!row.faculty_number_hash || !row.faculty_number_encrypted)) {
-                updates.faculty_number_encrypted = encryptRaw(facultyNorm);
-                updates.faculty_number_hash = hashForLookup(facultyNorm);
-            }
-        }
-
-        const fields = Object.keys(updates);
-        if (fields.length === 0) continue;
-
-        const setFragments = fields.map((field, idx) => `${field} = $${idx + 1}`);
-        const values = fields.map((field) => updates[field]);
-        values.push(row.id);
-
-        await client.query(
-            `UPDATE students SET ${setFragments.join(", ")} WHERE id = $${fields.length + 1}`,
-            values
-        );
-        studentsUpdated += 1;
-    }
-
-    const { rows: teacherRows } = await client.query(`
-        SELECT
-            id,
-            email,
-            email_encrypted,
-            email_hash
-        FROM teachers
-        WHERE email IS NOT NULL
-    `);
-
-    let teachersUpdated = 0;
-    for (const row of teacherRows) {
-        const updates = {};
-
-        if (row.email) {
-            const { plainText: emailPlain, wasEncrypted: emailWasEncrypted } =
-                getPlainTextFromPossiblyEncrypted(row.email);
-            const emailNorm = normalize(emailPlain);
-            if (emailNorm && (!row.email_hash || !row.email_encrypted || !emailWasEncrypted)) {
-                const emailEncrypted = encryptRaw(emailNorm);
-                updates.email = emailEncrypted;
-                updates.email_encrypted = emailEncrypted;
-                updates.email_hash = hashForLookup(emailNorm);
-            }
-        }
-
-        const fields = Object.keys(updates);
-        if (fields.length === 0) continue;
-
-        const setFragments = fields.map((field, idx) => `${field} = $${idx + 1}`);
-        const values = fields.map((field) => updates[field]);
-        values.push(row.id);
-
-        await client.query(
-            `UPDATE teachers SET ${setFragments.join(", ")} WHERE id = $${fields.length + 1}`,
-            values
-        );
-        teachersUpdated += 1;
-    }
-
-    return {
-        studentRowsChecked: studentRows.length,
-        studentsUpdated,
-        teacherRowsChecked: teacherRows.length,
-        teachersUpdated,
-    };
-};
-
 const formatServerTime = (rawTime) => {
     const date = rawTime instanceof Date ? rawTime : new Date(rawTime);
     if (Number.isNaN(date.getTime())) {
@@ -1103,17 +861,23 @@ const formatServerTime = (rawTime) => {
     return `${date.toISOString()} | Europe/Sofia: ${formatBgTime(date)}`;
 };
 
+// Tables from db/schema.sql. The server does not create or change tables itself.
+const REQUIRED_TABLES = [
+    "users",
+    "degrees",
+    "faculties",
+    "programs",
+    "students",
+    "courses",
+    "course_enrollments",
+    "lessons",
+    "attendance_statuses",
+    "attendance_records",
+    "billing_accounts",
+    "stripe_events",
+];
+
 const verifyAndPrintTables = async (client) => {
-    const requiredTables = [
-        "students",
-        "teachers",
-        "classes",
-        "class_students",
-        "attendances",
-        "attendance_timestamps",
-        "org_billing",
-        "stripe_events",
-    ];
 
     const { rows } = await client.query(`
         SELECT tablename
@@ -1128,9 +892,12 @@ const verifyAndPrintTables = async (client) => {
         tables: rows.map((row) => row.tablename),
     });
 
-    const missingTables = requiredTables.filter((tableName) => !existingTables.has(tableName));
-    for (const tableName of missingTables) {
-        emitLog("warn", "DB_TABLE_MISSING", { table: tableName });
+    const missingTables = REQUIRED_TABLES.filter((tableName) => !existingTables.has(tableName));
+    if (missingTables.length > 0) {
+        emitLog("error", "DB_SCHEMA_MISSING_TABLES", {
+            tables: missingTables,
+            hint: "Apply db/schema.sql to the database.",
+        });
     }
 };
 
@@ -1152,11 +919,7 @@ const verifyAndPrintTables = async (client) => {
         }
     })();
 
-    emitLog("info", "DB_STARTUP_BEGIN", {
-        dbHost: resolvedDbHost,
-        applyEncryptionMigration: APPLY_ENCRYPTION_MIGRATION,
-        applyEncryptionBackfill: APPLY_ENCRYPTION_BACKFILL,
-    });
+    emitLog("info", "DB_STARTUP_BEGIN", { dbHost: resolvedDbHost });
 
     for (let attempt = 1; attempt <= DB_STARTUP_RETRIES; attempt += 1) {
         let client;
@@ -1170,40 +933,7 @@ const verifyAndPrintTables = async (client) => {
                 serverTime: formatServerTime(result.rows[0]?.server_time),
             });
 
-            // --- Ensure required tables exist (idempotent) ---
-            await client.query(`
-                CREATE TABLE IF NOT EXISTS classes (
-                    id SERIAL PRIMARY KEY,
-                    teacher_id INTEGER NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
-                    name TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS attendances (
-                    id SERIAL PRIMARY KEY,
-                    class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
-                    student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-                    updated_at TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE(class_id, student_id)
-                );
-            `);
-            await applyAttendanceSchemaMigration(client);
-            emitLog("info", "DB_ATTENDANCE_SCHEMA_READY", {});
-            await db.ensureBillingTables();
-            emitLog("info", "DB_BILLING_TABLES_READY", {});
             await verifyAndPrintTables(client);
-            if (APPLY_ENCRYPTION_MIGRATION) {
-                emitLog("info", "DB_ENCRYPTION_MIGRATION_START", {});
-                await applyEncryptionMigration(client);
-                emitLog("info", "DB_ENCRYPTION_MIGRATION_END", {});
-            } else {
-                emitLog("info", "DB_ENCRYPTION_MIGRATION_SKIPPED", {});
-            }
-            if (APPLY_ENCRYPTION_BACKFILL) {
-                emitLog("info", "DB_ENCRYPTION_BACKFILL_START", {});
-                const backfillSummary = await backfillEncryptionForExistingData(client);
-                emitLog("info", "DB_ENCRYPTION_BACKFILL_END", backfillSummary);
-            } else {
-                emitLog("info", "DB_ENCRYPTION_BACKFILL_SKIPPED", {});
-            }
             emitLog("info", "DB_STARTUP_END", {});
             break; // success — exit retry loop
         } catch (err) {
@@ -1243,37 +973,7 @@ const tryDecryptValue = (value) => {
     }
 };
 
-const identifierMatches = ({ inputNormalized, rowHash, rowPlain, rowEncrypted }) => {
-    if (!inputNormalized) return false;
-
-    if (rowHash && hashForLookup(inputNormalized) === rowHash) return true;
-
-    if (typeof rowPlain === "string" && rowPlain && normalize(rowPlain) === inputNormalized) {
-        return true;
-    }
-
-    const decryptedPlain = tryDecryptValue(rowPlain);
-    if (decryptedPlain && normalize(decryptedPlain) === inputNormalized) {
-        return true;
-    }
-
-    const decryptedEncrypted = tryDecryptValue(rowEncrypted);
-    if (decryptedEncrypted && normalize(decryptedEncrypted) === inputNormalized) {
-        return true;
-    }
-
-    return false;
-};
-
-const getResolvedEmailForResponse = (row) => {
-    const fromMainColumn = resolveEmailForApi(row?.email);
-    if (fromMainColumn) return fromMainColumn;
-
-    const fromEncryptedColumn = resolveEmailForApi(row?.email_encrypted);
-    if (fromEncryptedColumn) return fromEncryptedColumn;
-
-    return null;
-};
+const getResolvedEmailForResponse = (row) => resolveEmailForApi(row?.email_encrypted);
 
 const canonicalizeFacultyNumberForResponse = (value) => {
     if (value === undefined || value === null) return null;
@@ -1288,21 +988,43 @@ const parsePositiveInteger = (value) => {
     return parsed;
 };
 
-const getResolvedFacultyNumberForResponse = (row = {}) => {
-    const fromEncryptedColumn = tryDecryptValue(row.faculty_number_encrypted);
-    if (fromEncryptedColumn) return canonicalizeFacultyNumberForResponse(fromEncryptedColumn);
+const getResolvedFacultyNumberForResponse = (row = {}) =>
+    canonicalizeFacultyNumberForResponse(tryDecryptValue(row.faculty_number_encrypted));
 
-    const fromMainColumn = tryDecryptValue(row.faculty_number);
-    if (fromMainColumn) return canonicalizeFacultyNumberForResponse(fromMainColumn);
+// Student columns in the shape serializeStudent() expects (the old API names:
+// group, course, faculty, level, specialization). Use with STUDENT_PROFILE_JOINS_SQL
+// after "FROM students st".
+const STUDENT_PROFILE_COLUMNS_SQL = `
+    u.id,
+    u.full_name,
+    u.email_encrypted,
+    st.faculty_number_encrypted,
+    st.group_number::text AS "group",
+    st.study_year AS course,
+    f.name_en AS faculty,
+    d.name_en AS level,
+    p.name_en AS specialization`;
+const STUDENT_PROFILE_JOINS_SQL = `
+    JOIN users u     ON u.id = st.user_id
+    JOIN programs p  ON p.id = st.program_id
+    JOIN faculties f ON f.id = p.faculty_id
+    JOIN degrees d   ON d.code = p.degree_code`;
 
-    return canonicalizeFacultyNumberForResponse(row.faculty_number);
+const findStudentIdByFacultyNumber = async (db, facultyNumber) => {
+    const facultyNorm = normalize(String(facultyNumber ?? ""));
+    if (!facultyNorm) return null;
+    const { rows } = await db.query(
+        "SELECT user_id FROM students WHERE faculty_number_hash = $1",
+        [hashForLookup(facultyNorm)]
+    );
+    return rows.length ? Number(rows[0].user_id) : null;
 };
 
 const emailResolveNullCountsByEndpoint = new Map();
 
 const withStudentResponseIdentifiers = (row = {}, { endpoint = "unknown" } = {}) => {
     const response = serializeStudent(row);
-    const sourceEmail = row.email ?? row.email_encrypted;
+    const sourceEmail = row.email_encrypted;
 
     if (typeof sourceEmail === "string" && sourceEmail.trim() && response.email === null) {
         const currentCount = emailResolveNullCountsByEndpoint.get(endpoint) || 0;
@@ -1334,19 +1056,16 @@ const withAttendanceStudentIdentifiers = (row = {}) => {
     return response;
 };
 
-const ATTENDANCE_DERIVED_COUNT_FILTER_SQL = "(joined_at IS NOT NULL OR left_at IS NOT NULL)";
 const ATTENDANCE_POSITIVE_STATUSES = new Set(["attended", "present", "completed", "checked_in", "checked-in"]);
 const ATTENDANCE_ABSENT_STATUS = "absent";
+const ATTENDANCE_PRESENT_STATUS = "present";
 
 // Client-generated id for one scanner session; reused on retries so a retried
-// Finish updates the same absence rows instead of adding new ones.
+// Finish updates the same lesson instead of adding a new one.
 const normalizeAttendanceSessionId = (value) => {
     const text = typeof value === "string" ? value.trim() : "";
     return /^[A-Za-z0-9_-]{8,64}$/.test(text) ? text : null;
 };
-
-const buildAbsenceSessionKey = ({ classId, studentId, sessionId }) =>
-    crypto.createHash("sha256").update(`${classId}|${studentId}|absent|${sessionId}`).digest("hex");
 
 const normalizeAttendanceStatus = (value) => {
     if (typeof value !== "string") return null;
@@ -1379,87 +1098,29 @@ const parseOptionalIsoTimestamp = (value) => {
     return { ok: true, value: parsed.toISOString() };
 };
 
-const buildAttendanceSessionKey = ({ classId, studentId, joinedAt, leftAt }) => {
-    const sessionWindowAnchor = joinedAt || leftAt || "";
-    const raw = `${classId}|${studentId}|${sessionWindowAnchor}`;
-    return crypto.createHash("sha256").update(raw).digest("hex");
-};
-
+// Resolves scanner records to student ids, caching lookups within one request.
 const buildAttendanceStudentResolver = (client) => {
-    const studentByIdCache = new Map();
-    const studentByFacultyNormCache = new Map();
-    let fallbackFacultyCandidates = null;
+    const studentIdByIdCache = new Map();
+    const studentIdByFacultyCache = new Map();
 
     const resolveById = async (value) => {
         const studentId = parsePositiveInteger(value);
         if (!studentId) return null;
-        if (studentByIdCache.has(studentId)) {
-            return studentByIdCache.get(studentId);
+        if (!studentIdByIdCache.has(studentId)) {
+            const { rows } = await client.query("SELECT user_id FROM students WHERE user_id = $1", [studentId]);
+            studentIdByIdCache.set(studentId, rows.length ? studentId : null);
         }
-
-        const { rows } = await client.query(
-            `
-            SELECT id, faculty_number, faculty_number_encrypted, faculty_number_hash
-            FROM students
-            WHERE id = $1
-            LIMIT 1
-            `,
-            [studentId]
-        );
-        const row = rows[0] || null;
-        studentByIdCache.set(studentId, row);
-        return row;
+        return studentIdByIdCache.get(studentId);
     };
 
     const resolveByFacultyNumber = async (value) => {
         if (value === undefined || value === null) return null;
         const facultyNorm = normalize(String(value));
         if (!facultyNorm) return null;
-
-        if (studentByFacultyNormCache.has(facultyNorm)) {
-            return studentByFacultyNormCache.get(facultyNorm);
+        if (!studentIdByFacultyCache.has(facultyNorm)) {
+            studentIdByFacultyCache.set(facultyNorm, await findStudentIdByFacultyNumber(client, facultyNorm));
         }
-
-        const facultyHash = hashForLookup(facultyNorm);
-        const fastResult = await client.query(
-            `
-            SELECT id, faculty_number, faculty_number_encrypted, faculty_number_hash
-            FROM students
-            WHERE faculty_number_hash = $1
-            LIMIT 1
-            `,
-            [facultyHash]
-        );
-
-        let row = fastResult.rows[0] || null;
-        if (!row) {
-            if (!fallbackFacultyCandidates) {
-                const fallbackResult = await client.query(
-                    `
-                    SELECT id, faculty_number, faculty_number_encrypted, faculty_number_hash
-                    FROM students
-                    ORDER BY id ASC
-                    LIMIT 10000
-                    `
-                );
-                fallbackFacultyCandidates = fallbackResult.rows;
-            }
-
-            row = fallbackFacultyCandidates.find((candidate) => {
-                return identifierMatches({
-                    inputNormalized: facultyNorm,
-                    rowHash: candidate.faculty_number_hash,
-                    rowPlain: candidate.faculty_number,
-                    rowEncrypted: candidate.faculty_number_encrypted,
-                });
-            }) || null;
-        }
-
-        studentByFacultyNormCache.set(facultyNorm, row);
-        if (row?.id) {
-            studentByIdCache.set(Number(row.id), row);
-        }
-        return row;
+        return studentIdByFacultyCache.get(facultyNorm);
     };
 
     return {
@@ -1468,78 +1129,17 @@ const buildAttendanceStudentResolver = (client) => {
     };
 };
 
-const recomputeAttendanceSummaryForClass = async (client, classId) => {
-    const classIdNum = parsePositiveInteger(classId);
-    if (!classIdNum) {
-        throw new Error("Invalid class_id for summary recomputation");
-    }
-
-    await client.query(
-        `
-        WITH derived AS (
-            SELECT
-                class_id,
-                student_id,
-                COUNT(DISTINCT session_key)::INTEGER AS derived_count
-            FROM attendance_timestamps
-            WHERE class_id = $1
-              AND ${ATTENDANCE_DERIVED_COUNT_FILTER_SQL}
-            GROUP BY class_id, student_id
-        )
-        INSERT INTO attendances (class_id, student_id, count, updated_at)
-        SELECT
-            d.class_id,
-            d.student_id,
-            d.derived_count,
-            NOW()
-        FROM derived d
-        ON CONFLICT (class_id, student_id)
-        DO UPDATE SET
-            count = EXCLUDED.count,
-            updated_at = NOW()
-        `,
-        [classIdNum]
-    );
-
-    await client.query(
-        `
-        UPDATE attendances a
-        SET
-            count = 0,
-            updated_at = NOW()
-        WHERE a.class_id = $1
-          AND NOT EXISTS (
-              SELECT 1
-              FROM attendance_timestamps at
-              WHERE at.class_id = a.class_id
-                AND at.student_id = a.student_id
-                AND ${ATTENDANCE_DERIVED_COUNT_FILTER_SQL}
-          )
-          AND COALESCE(a.count, 0) <> 0
-        `,
-        [classIdNum]
-    );
+// Replaces an old-format password with argon2 after a successful login.
+const upgradePasswordHash = async (userId, plainPassword) => {
+    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [await hashPassword(plainPassword), userId]);
 };
 
-const updateAuthFieldsById = async (tableName, id, updates) => {
-    const fields = Object.keys(updates || {});
-    if (fields.length === 0) return;
-
-    const setSql = fields.map((field, idx) => `${field} = $${idx + 1}`).join(", ");
-    const values = fields.map((field) => updates[field]);
-    values.push(id);
-
-    await pool.query(
-        `UPDATE ${tableName} SET ${setSql} WHERE id = $${fields.length + 1}`,
-        values
-    );
-};
-
-
-
-
-
-
+const verifyLoginPassword = (password, storedHash) => verifyStoredPassword({
+    inputPassword: password,
+    storedHash,
+    legacyHashVerifier: hashExactForLookup,
+    legacyDecryptor: tryDecryptValue,
+});
 
 app.post("/teacherLogin", async (req, res) => {
     logRequestStart(req);
@@ -1557,59 +1157,19 @@ app.post("/teacherLogin", async (req, res) => {
             });
         }
 
-
         const emailNorm = normalize(email);
         const emailHash = hashForLookup(emailNorm);
 
-        const fastResult = await pool.query(
+        const { rows } = await pool.query(
             `
-            SELECT id, full_name, email, email_encrypted, email_hash, password, password_hash, hash_algorithm, password_updated_at
-            FROM teachers
-            WHERE email_hash = $1
-            LIMIT 1
+            SELECT id, full_name, email_encrypted, password_hash
+            FROM users
+            WHERE email_hash = $1 AND role = 'teacher'
             `,
             [emailHash]
         );
-
-        let candidateRows = fastResult.rows;
-        if (!candidateRows.length) {
-            const fallbackCandidates = await pool.query(
-                `
-                SELECT id, full_name, email, email_encrypted, email_hash, password, password_hash, hash_algorithm, password_updated_at
-                FROM teachers
-                ORDER BY id ASC
-                LIMIT 5000
-                `
-            );
-
-            candidateRows = fallbackCandidates.rows.filter((row) => {
-                return identifierMatches({
-                    inputNormalized: emailNorm,
-                    rowHash: row.email_hash,
-                    rowPlain: row.email,
-                    rowEncrypted: row.email_encrypted,
-                });
-            });
-        }
-
-        let teacher = null;
-        let passwordCheck = { isValid: false, needsMigration: false, matchedWith: null };
-        for (const candidate of candidateRows) {
-            const candidateCheck = await verifyPasswordWithMigration({
-                inputPassword: password,
-                rowPassword: candidate.password,
-                rowPasswordHash: candidate.password_hash,
-                rowHashAlgorithm: candidate.hash_algorithm,
-                legacyHashVerifier: hashExactForLookup,
-                legacyDecryptor: tryDecryptValue,
-            });
-
-            if (candidateCheck.isValid) {
-                teacher = candidate;
-                passwordCheck = candidateCheck;
-                break;
-            }
-        }
+        const teacher = rows[0] || null;
+        const passwordCheck = teacher ? await verifyLoginPassword(password, teacher.password_hash) : null;
 
         if (!teacher || !passwordCheck.isValid) {
             recordLoginFailure(loginAttemptKey);
@@ -1619,38 +1179,11 @@ app.post("/teacherLogin", async (req, res) => {
         }
         clearLoginFailures(loginAttemptKey);
 
-        const updates = {};
-        const emailFromMainColumn = tryDecryptValue(teacher.email);
-
-        if (!teacher.email_hash) {
-            updates.email_hash = emailHash;
-        }
-        if (!teacher.email_encrypted) {
-            updates.email_encrypted = emailFromMainColumn ? teacher.email : encryptRaw(emailNorm);
-        }
-        if (!emailFromMainColumn) {
-            updates.email = updates.email_encrypted || encryptRaw(emailNorm);
-        }
-
         if (passwordCheck.needsMigration) {
-            Object.assign(updates, await buildArgon2PasswordFields(password));
-        } else {
-            if (!teacher.hash_algorithm) {
-                updates.hash_algorithm = ARGON2_ALGORITHM;
-            }
-            if (!teacher.password_updated_at) {
-                updates.password_updated_at = new Date();
-            }
-            if (teacher.password !== null) {
-                updates.password = null;
-            }
+            await upgradePasswordHash(teacher.id, password);
         }
 
-        await updateAuthFieldsById("teachers", teacher.id, updates);
-        const resolvedEmail = getResolvedEmailForResponse({
-            ...teacher,
-            ...updates,
-        });
+        const resolvedEmail = getResolvedEmailForResponse(teacher);
         const tokenPayload = issueTeacherToken({
             teacherId: teacher.id,
             emailHash: emailHash,
@@ -1676,10 +1209,6 @@ app.post("/teacherLogin", async (req, res) => {
     }
 });
 
-
-
-
-
 app.post("/studentLogin", async (req, res) => {
     logRequestStart(req);
 
@@ -1696,93 +1225,19 @@ app.post("/studentLogin", async (req, res) => {
             });
         }
 
+        const facultyHash = hashForLookup(normalize(facultyNumber));
 
-        const facultyNorm = normalize(facultyNumber);
-        const facultyHash = hashForLookup(facultyNorm);
-
-        const fastResult = await pool.query(
+        const { rows } = await pool.query(
             `
-            SELECT
-                id,
-                full_name,
-                email,
-                email_encrypted,
-                email_hash,
-                faculty_number,
-                faculty_number_encrypted,
-                faculty_number_hash,
-                password,
-                password_hash,
-                hash_algorithm,
-                password_updated_at,
-                "group",
-                course,
-                faculty,
-                level,
-                specialization
-            FROM students
-            WHERE faculty_number_hash = $1
-            LIMIT 1
+            SELECT ${STUDENT_PROFILE_COLUMNS_SQL}, u.password_hash
+            FROM students st
+            ${STUDENT_PROFILE_JOINS_SQL}
+            WHERE st.faculty_number_hash = $1
             `,
             [facultyHash]
         );
-
-        let candidateRows = fastResult.rows;
-        if (!candidateRows.length) {
-            const fallbackCandidates = await pool.query(
-                `
-                SELECT
-                    id,
-                    full_name,
-                    email,
-                    email_encrypted,
-                    email_hash,
-                    faculty_number,
-                    faculty_number_encrypted,
-                    faculty_number_hash,
-                    password,
-                    password_hash,
-                    hash_algorithm,
-                    password_updated_at,
-                    "group",
-                    course,
-                    faculty,
-                    level,
-                    specialization
-                FROM students
-                ORDER BY id ASC
-                LIMIT 10000
-                `
-            );
-
-            candidateRows = fallbackCandidates.rows.filter((row) => {
-                return identifierMatches({
-                    inputNormalized: facultyNorm,
-                    rowHash: row.faculty_number_hash,
-                    rowPlain: row.faculty_number,
-                    rowEncrypted: row.faculty_number_encrypted,
-                });
-            });
-        }
-
-        let studentRow = null;
-        let passwordCheck = { isValid: false, needsMigration: false, matchedWith: null };
-        for (const candidate of candidateRows) {
-            const candidateCheck = await verifyPasswordWithMigration({
-                inputPassword: password,
-                rowPassword: candidate.password,
-                rowPasswordHash: candidate.password_hash,
-                rowHashAlgorithm: candidate.hash_algorithm,
-                legacyHashVerifier: hashExactForLookup,
-                legacyDecryptor: tryDecryptValue,
-            });
-
-            if (candidateCheck.isValid) {
-                studentRow = candidate;
-                passwordCheck = candidateCheck;
-                break;
-            }
-        }
+        const studentRow = rows[0] || null;
+        const passwordCheck = studentRow ? await verifyLoginPassword(password, studentRow.password_hash) : null;
 
         if (!studentRow || !passwordCheck.isValid) {
             recordLoginFailure(loginAttemptKey);
@@ -1792,58 +1247,11 @@ app.post("/studentLogin", async (req, res) => {
         }
         clearLoginFailures(loginAttemptKey);
 
-        const updates = {};
-        const emailFromMainColumn = tryDecryptValue(studentRow.email);
-        const facultyFromMainColumn = tryDecryptValue(studentRow.faculty_number);
-
         if (passwordCheck.needsMigration) {
-            Object.assign(updates, await buildArgon2PasswordFields(password));
-        } else {
-            if (!studentRow.hash_algorithm) {
-                updates.hash_algorithm = ARGON2_ALGORITHM;
-            }
-            if (!studentRow.password_updated_at) {
-                updates.password_updated_at = new Date();
-            }
-            if (studentRow.password !== null) {
-                updates.password = null;
-            }
+            await upgradePasswordHash(studentRow.id, password);
         }
 
-        if (!studentRow.faculty_number_hash) {
-            updates.faculty_number_hash = facultyHash;
-        }
-        if (!studentRow.faculty_number_encrypted) {
-            updates.faculty_number_encrypted = facultyFromMainColumn
-                ? studentRow.faculty_number
-                : encryptRaw(facultyNorm);
-        }
-
-        if (!studentRow.email_hash || !studentRow.email_encrypted || !emailFromMainColumn) {
-            const resolvedEmail = getResolvedEmailForResponse(studentRow);
-            const normalizedEmail = normalize(resolvedEmail || "");
-            if (normalizedEmail) {
-                if (!studentRow.email_hash) {
-                    updates.email_hash = hashForLookup(normalizedEmail);
-                }
-                if (!studentRow.email_encrypted) {
-                    updates.email_encrypted = emailFromMainColumn
-                        ? studentRow.email
-                        : encryptRaw(normalizedEmail);
-                }
-                if (!emailFromMainColumn) {
-                    updates.email = updates.email_encrypted || encryptRaw(normalizedEmail);
-                }
-            }
-        }
-
-        await updateAuthFieldsById("students", studentRow.id, updates);
-
-        const student = withStudentResponseIdentifiers({
-            ...studentRow,
-            ...updates,
-        }, { endpoint: "POST /studentLogin" });
-
+        const student = withStudentResponseIdentifiers(studentRow, { endpoint: "POST /studentLogin" });
         const studentToken = issueStudentToken({ studentId: studentRow.id });
 
         return res.send({
@@ -1907,18 +1315,38 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
             return res.status(400).send({ message: "Invalid registration data." });
         }
 
+        // The form sends the visible option labels (English or Bulgarian). Both
+        // sides are lowercased in SQL so the comparison follows the database locale.
+        const programResult = await pool.query(
+            `
+            SELECT p.id
+            FROM programs p
+            JOIN faculties f ON f.id = p.faculty_id
+            JOIN degrees d   ON d.code = p.degree_code
+            WHERE lower($1) IN (lower(f.code), lower(f.name_en), lower(f.name_bg))
+              AND lower($2) IN (lower(d.code), lower(d.name_en), lower(d.name_bg))
+              AND lower($3) IN (lower(p.code), lower(p.name_en), lower(p.name_bg))
+            LIMIT 1
+            `,
+            [String(user.faculty ?? "").trim(), String(user.level ?? "").trim(), String(user.specialization ?? "").trim()]
+        );
+        if (!programResult.rows.length) {
+            return res.status(400).send({ message: "Invalid faculty, level or specialization." });
+        }
+        const programId = programResult.rows[0].id;
+
         const emailEncrypted = encryptRaw(normalizedEmail);
         const emailHash = hashForLookup(normalizedEmail);
 
         const facultyEncrypted = encryptRaw(normalizedFacultyNumber);
         const facultyHash = hashForLookup(normalizedFacultyNumber);
 
-        const passwordFields = await buildArgon2PasswordFields(user.password);
+        const passwordHash = await hashPassword(user.password);
 
         const duplicateCheck = await pool.query(
             `
             SELECT
-                EXISTS(SELECT 1 FROM students WHERE email_hash = $1) AS email_exists,
+                EXISTS(SELECT 1 FROM users WHERE email_hash = $1) AS email_exists,
                 EXISTS(SELECT 1 FROM students WHERE faculty_number_hash = $2) AS faculty_number_exists
             `,
             [emailHash, facultyHash]
@@ -1935,48 +1363,27 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
             });
         }
 
+        // One statement, so the user and the student profile are created together.
         const insertSql = `
-            INSERT INTO students (
-                full_name,
-                email,
-                faculty_number,
-                password,
-                password_hash,
-                hash_algorithm,
-                password_updated_at,
-                level,
-                faculty,
-                specialization,
-                "group",
-                course,
-                created,
-                email_encrypted,
-                email_hash,
-                faculty_number_encrypted,
-                faculty_number_hash
-            ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
+            WITH new_user AS (
+                INSERT INTO users (role, full_name, email_encrypted, email_hash, password_hash)
+                VALUES ('student', $1, $2, $3, $4)
+                RETURNING id
             )
-            RETURNING id, full_name, email, faculty_number, "group", course, faculty, level, specialization
+            INSERT INTO students (user_id, faculty_number_encrypted, faculty_number_hash, program_id, study_year, group_number)
+            SELECT id, $5, $6, $7, $8, $9 FROM new_user
+            RETURNING user_id
         `;
         const insertValues = [
             fullName,
             emailEncrypted,
-            facultyEncrypted,
-            passwordFields.password,
-            passwordFields.password_hash,
-            passwordFields.hash_algorithm,
-            passwordFields.password_updated_at,
-            user.level,
-            user.faculty,
-            user.specialization,
-            String(groupValidation.parsed),
-            String(courseValue),
-            new Date(),
-            emailEncrypted,
             emailHash,
+            passwordHash,
             facultyEncrypted,
             facultyHash,
+            programId,
+            Number(courseValue),
+            groupValidation.parsed,
         ];
         const result = await insertStudentWithIdCollisionRecovery({
             pool,
@@ -1986,12 +1393,11 @@ app.post("/registration", registrationRateLimit, async (req, res) => {
             logger: console,
         });
 
-        const student = withStudentResponseIdentifiers({
-            ...result.rows[0],
-            email: normalizedEmail,
-            email_encrypted: result.rows[0].email,
-            faculty_number: normalizedFacultyNumber,
-        }, { endpoint: "POST /registration" });
+        const { rows: profileRows } = await pool.query(
+            `SELECT ${STUDENT_PROFILE_COLUMNS_SQL} FROM students st ${STUDENT_PROFILE_JOINS_SQL} WHERE st.user_id = $1`,
+            [result.rows[0].user_id]
+        );
+        const student = withStudentResponseIdentifiers(profileRows[0], { endpoint: "POST /registration" });
         return res.send({ message: "User registration successful", student, registrationSuccess: true });
     } catch (error) {
         const mapped = mapRegistrationUniqueViolation(error);
@@ -2054,27 +1460,39 @@ app.get("/students", requireTeacherAuth, async (req, res) => {
         const whereClauses = [];
         const params = [];
 
-        const addFilter = (column, value) => {
-            params.push(String(value).toLowerCase());
-            whereClauses.push(`LOWER(${column}) = $${params.length}`);
+        // Filters accept a code or either language's name, case-insensitively.
+        const addLabelFilter = (alias, value) => {
+            params.push(String(value).trim());
+            whereClauses.push(`lower($${params.length}) IN (lower(${alias}.code), lower(${alias}.name_en), lower(${alias}.name_bg))`);
         };
 
-        if (level) addFilter("level", level);
-        if (faculty) addFilter("faculty", faculty);
-        if (specialization) addFilter("specialization", specialization);
-        if (group) addFilter("\"group\"", group);
+        if (level) addLabelFilter("d", level);
+        if (faculty) addLabelFilter("f", faculty);
+        if (specialization) addLabelFilter("p", specialization);
+        if (group) {
+            params.push(String(group).trim());
+            whereClauses.push(`st.group_number::text = $${params.length}`);
+        }
 
         if (search) {
-            const term = `%${String(search).toLowerCase()}%`;
-            params.push(term);
-            const placeholder = `$${params.length}`;
+            params.push(`%${String(search).trim()}%`);
+            const namePlaceholder = `$${params.length}`;
+            // Faculty numbers are encrypted, so they match exactly (by hash), not by substring.
+            params.push(hashForLookup(normalize(String(search))));
+            const facultyHashPlaceholder = `$${params.length}`;
             whereClauses.push(
-                `(LOWER(full_name) LIKE ${placeholder} OR LOWER(faculty_number) LIKE ${placeholder})`
+                `(lower(u.full_name) LIKE lower(${namePlaceholder}) OR st.faculty_number_hash = ${facultyHashPlaceholder})`
             );
         }
 
         const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(" AND ")}` : "";
-        const sql = `SELECT * FROM students ${whereSql} ORDER BY id DESC`;
+        const sql = `
+            SELECT ${STUDENT_PROFILE_COLUMNS_SQL}
+            FROM students st
+            ${STUDENT_PROFILE_JOINS_SQL}
+            ${whereSql}
+            ORDER BY u.id DESC
+        `;
 
         const result = await pool.query(sql, params);
         const students = result.rows.map((row) => withStudentResponseIdentifiers(row, { endpoint: "GET /students" }));
@@ -2085,6 +1503,14 @@ app.get("/students", requireTeacherAuth, async (req, res) => {
     }
 });
 
+const DUPLICATE_CLASS_NAME_RESPONSE = { error: "You already have a class with this name" };
+
+// "completed_classes_count" is the number of lessons held, kept under the old name.
+const CLASS_COLUMNS_SQL = `
+    c.id,
+    c.teacher_id,
+    c.name,
+    (SELECT count(*)::integer FROM lessons l WHERE l.course_id = c.id) AS completed_classes_count`;
 
 // ----------------- Class Creation Endpoint -----------------
 // Expects body: { name: string, students?: Array }
@@ -2092,17 +1518,15 @@ app.post("/classes", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
     const { name, students } = req.body || {};
+    const className = typeof name === "string" ? name.trim() : "";
 
-    if (!name) {
+    if (!className) {
         return res.status(400).send({ error: "Class name is required" });
     }
     try {
-        const teacherId = req.authTeacherId;
-
-
         const insertResult = await pool.query(
-            "INSERT INTO classes (teacher_id, name) VALUES ($1, $2) RETURNING id, teacher_id, name",
-            [teacherId, name]
+            "INSERT INTO courses (teacher_id, name) VALUES ($1, $2) RETURNING id, teacher_id, name",
+            [req.authTeacherId, className]
         );
 
         const created = insertResult.rows[0];
@@ -2114,34 +1538,28 @@ app.post("/classes", requireTeacherAuth, async (req, res) => {
         res.status(201).send({ message: "Class created", class: created });
 
     } catch (error) {
+        if (error?.code === "23505") {
+            return res.status(409).send(DUPLICATE_CLASS_NAME_RESPONSE);
+        }
         logRouteError(req, "CLASS_CREATE_ERROR", error);
         res.status(500).send({ error: "Internal server error" });
     }
 });
 
-// GET /classes?class_id=N returns one class (public); GET /classes lists the logged-in teacher's classes.
-app.get("/classes", requireTeacherAuthUnlessClassId, async (req, res) => {
+// GET /classes lists the logged-in teacher's classes; ?class_id=N returns one of them.
+app.get("/classes", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
     const { class_id } = req.query;
     try {
-        const requestedClassIdRaw = class_id;
-        if (requestedClassIdRaw !== undefined) {
-            const requestedClassId = Number.parseInt(String(requestedClassIdRaw), 10);
-            if (!Number.isInteger(requestedClassId) || requestedClassId <= 0) {
+        if (class_id !== undefined) {
+            const requestedClassId = parsePositiveInteger(class_id);
+            if (!requestedClassId) {
                 return res.status(400).send({ error: "class_id must be a positive integer" });
             }
 
             const classResult = await pool.query(
-                `
-                SELECT
-                    id,
-                    teacher_id,
-                    name,
-                    COALESCE(completed_classes_count, 0) AS completed_classes_count
-                FROM classes
-                WHERE id = $1
-                `,
-                [requestedClassId]
+                `SELECT ${CLASS_COLUMNS_SQL} FROM courses c WHERE c.id = $1 AND c.teacher_id = $2`,
+                [requestedClassId, req.authTeacherId]
             );
             if (classResult.rows.length === 0) {
                 return res.status(404).send({ error: "Class not found" });
@@ -2155,32 +1573,30 @@ app.get("/classes", requireTeacherAuthUnlessClassId, async (req, res) => {
             });
         }
 
-        // Always list the logged-in teacher's own classes; the teacherEmail
-        // query param is ignored so nobody can list another teacher's classes.
-        {
-            const teacherId = req.authTeacherId;
-
-            const classes = await pool.query(
-                `
-                SELECT
-                    id,
-                    teacher_id,
-                    name,
-                    COALESCE(completed_classes_count, 0) AS completed_classes_count
-                FROM classes
-                WHERE teacher_id = $1
-                ORDER BY id DESC
-                `,
-                [teacherId]
-            );
-            
-            return res.send({ message: "Classes fetched", classes: classes.rows });
-        }
+        const classes = await pool.query(
+            `SELECT ${CLASS_COLUMNS_SQL} FROM courses c WHERE c.teacher_id = $1 ORDER BY c.id DESC`,
+            [req.authTeacherId]
+        );
+        return res.send({ message: "Classes fetched", classes: classes.rows });
     } catch (error) {
         logRouteError(req, "CLASSES_FETCH_ERROR", error);
         res.status(500).send({ error: "Internal server error" });
     }
 });
+
+// Checks that a class exists and belongs to the teacher; sends the error response if not.
+const ensureTeacherOwnsClass = async (req, res, classId, forbiddenMessage) => {
+    const { rows } = await pool.query("SELECT teacher_id FROM courses WHERE id = $1", [classId]);
+    if (rows.length === 0) {
+        res.status(404).send({ error: "Class not found" });
+        return false;
+    }
+    if (Number(rows[0].teacher_id) !== Number(req.authTeacherId)) {
+        res.status(403).send({ error: forbiddenMessage });
+        return false;
+    }
+    return true;
+};
 
 // ----------------- Class Rename Endpoint -----------------
 // Expects body: { classId: number, name: string }
@@ -2188,39 +1604,24 @@ app.put("/classes", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
     const { classId, name } = req.body || {};
+    const classIdNum = parsePositiveInteger(classId);
+    const newName = typeof name === "string" ? name.trim() : "";
 
-    if (!classId) {
+    if (!classIdNum) {
         return res.status(400).send({ error: "classId is required" });
     }
-    if (!name) {
+    if (!newName) {
         return res.status(400).send({ error: "name is required" });
     }
     try {
-        const teacherId = req.authTeacherId;
+        if (!(await ensureTeacherOwnsClass(req, res, classIdNum, "You do not have permission to rename this class"))) return;
 
-        const classResult = await pool.query(
-            "SELECT id, teacher_id FROM classes WHERE id = $1",
-            [classId]
-        );
-        if (classResult.rows.length === 0) {
-            return res.status(404).send({ error: "Class not found" });
-        }
-        const classTeacherId = Number.parseInt(String(classResult.rows[0].teacher_id), 10);
-        if (!Number.isInteger(classTeacherId) || classTeacherId !== teacherId) {
-            return res.status(403).send({ error: "You do not have permission to rename this class" });
-        }
-
-        const updateResult = await pool.query(
-            "UPDATE classes SET name = $1 WHERE id = $2 AND teacher_id = $3",
-            [name, classId, teacherId]
-        );
-
-        if (updateResult.rowCount === 0) {
-            return res.status(404).send({ error: "Class not found for this teacher" });
-        }
-
+        await pool.query("UPDATE courses SET name = $1 WHERE id = $2", [newName, classIdNum]);
         return res.status(200).send({ success: true });
     } catch (error) {
+        if (error?.code === "23505") {
+            return res.status(409).send(DUPLICATE_CLASS_NAME_RESPONSE);
+        }
         logRouteError(req, "CLASS_RENAME_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     }
@@ -2228,56 +1629,23 @@ app.put("/classes", requireTeacherAuth, async (req, res) => {
 
 // ----------------- Class Deletion Endpoint -----------------
 // Expects body: { classId: number }
-// Deletes class + related rows (class_students, attendances, attendance_timestamps)
+// Enrollments, lessons and attendance records go with the class (ON DELETE CASCADE).
 app.delete("/classes", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
-    const { classId } = req.body || {};
+    const classIdNum = parsePositiveInteger(req.body?.classId);
 
-    if (!classId) {
+    if (!classIdNum) {
         return res.status(400).send({ error: "classId is required" });
     }
-    const client = await pool.connect();
     try {
-        await client.query("BEGIN");
-        const teacherId = req.authTeacherId;
+        if (!(await ensureTeacherOwnsClass(req, res, classIdNum, "You do not have permission to delete this class"))) return;
 
-        const classResult = await client.query(
-            "SELECT id, teacher_id FROM classes WHERE id = $1",
-            [classId]
-        );
-        if (classResult.rows.length === 0) {
-            await client.query("ROLLBACK");
-            return res.status(404).send({ error: "Class not found" });
-        }
-        const classTeacherId = Number.parseInt(String(classResult.rows[0].teacher_id), 10);
-        if (!Number.isInteger(classTeacherId) || classTeacherId !== teacherId) {
-            await client.query("ROLLBACK");
-            return res.status(403).send({ error: "You do not have permission to delete this class" });
-        }
-
-        await client.query("DELETE FROM class_students WHERE class_id = $1", [classId]);
-        await client.query("DELETE FROM attendance_timestamps WHERE class_id = $1", [classId]);
-        await client.query("DELETE FROM attendances WHERE class_id = $1", [classId]);
-
-        const deleteClass = await client.query(
-            "DELETE FROM classes WHERE id = $1 AND teacher_id = $2 RETURNING id",
-            [classId, teacherId]
-        );
-
-        if (deleteClass.rows.length === 0) {
-            await client.query("ROLLBACK");
-            return res.status(404).send({ error: "Class not found for this teacher" });
-        }
-
-        await client.query("COMMIT");
+        await pool.query("DELETE FROM courses WHERE id = $1", [classIdNum]);
         return res.status(200).send({ success: true });
     } catch (error) {
-        await client.query("ROLLBACK");
         logRouteError(req, "CLASS_DELETE_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
-    } finally {
-        client.release();
     }
 });
 
@@ -2309,23 +1677,12 @@ app.get("/class_students", requireTeacherAuth, requireOwnedClass, async (req, re
     try {
         const { rows } = await pool.query(
             `
-            SELECT
-                s.id,
-                s.id AS student_id,
-                s.full_name,
-                s.email,
-                s.email_encrypted,
-                s.faculty_number,
-                s.faculty_number_encrypted,
-                s."group",
-                s.course,
-                s.faculty,
-                s.level,
-                s.specialization
-            FROM class_students cs
-            JOIN students s ON s.id = cs.student_id
-            WHERE cs.class_id = $1
-            ORDER BY s.full_name ASC, s.id ASC
+            SELECT ${STUDENT_PROFILE_COLUMNS_SQL}
+            FROM course_enrollments e
+            JOIN students st ON st.user_id = e.student_id
+            ${STUDENT_PROFILE_JOINS_SQL}
+            WHERE e.course_id = $1
+            ORDER BY u.full_name ASC, u.id ASC
             `,
             [classId]
         );
@@ -2345,94 +1702,9 @@ app.get("/class_students", requireTeacherAuth, requireOwnedClass, async (req, re
 
 
 
-app.get("/get_student_classes", async (req, res) => {
-    logRequestStart(req);
-
-    const rawStudentId = req.query.student_id;
-    const facultyNumber = req.query.faculty_number;
-
-    if ((!rawStudentId || rawStudentId === "undefined" || rawStudentId === "null") && !facultyNumber) {
-        return res.status(400).send({ error: "student_id or faculty_number query parameter is required" });
-    }
-
-    let studentIdNum = null;
-    if (rawStudentId && rawStudentId !== "undefined" && rawStudentId !== "null") {
-        studentIdNum = Number(rawStudentId);
-        if (!Number.isFinite(studentIdNum) || studentIdNum <= 0) {
-            return res.status(400).send({ error: "student_id must be a valid number" });
-        }
-    } else if (facultyNumber) {
-        const facNorm = normalize(facultyNumber);
-        const facHash = hashForLookup(facNorm);
-        const studentLookup = await pool.query(
-            "SELECT id FROM students WHERE faculty_number_hash = $1",
-            [facHash]
-        );
-        if (studentLookup.rows.length === 0) {
-            return res.status(200).send({ message: "Student not found", class_names: [] });
-        }
-        studentIdNum = studentLookup.rows[0].id;
-    }
-
-    const sql = `SELECT * FROM class_students WHERE student_id = $1`;
-    const result  = await pool.query(sql, [studentIdNum]);
-
-
-
-
-
-    // Collect unique class IDs from result rows
-    const classIds = Array.from(new Set(result.rows.map(row => Number(row.class_id)).filter(Boolean)));
-
-    let classNames = [];
-
-    if (classIds.length > 0) {
-        const placeholders = classIds.map((_, i) => `$${i + 1}`).join(',');
-        const sql = `SELECT id, name FROM classes WHERE id IN (${placeholders})`;
-        const { rows: classRows } = await pool.query(sql, classIds);
-
-        // Build id -> name map
-        const nameById = new Map(classRows.map(row => [Number(row.id), row.name]));
-
-        // Preserve original order if needed
-        classNames = result.rows
-            .map(row => nameById.get(Number(row.class_id)))
-            .filter(Boolean);
-    }
-
-
-
-
-
-
-    return res.send({
-        message: "Student classes fetched",
-        class_names: classNames
-    });
-
-});
-
-
-
-
-
 // ----------------- Student self-service endpoints -----------------
-// Columns attended/completed_classes_count/max_attended_in_class come from
-// STUDENT_COURSE_TOTALS_SQL. Same rule the student page used before: the class's
-// completed count, else the highest count in the class, and never below this
-// student's count.
-const studentCourseTotals = (row) => {
-    const attended = Number(row.attended) || 0;
-    const recorded = Number(row.completed_classes_count) || 0;
-    const fallback = Number(row.max_attended_in_class) || 0;
-    return { attended, total: Math.max(recorded > 0 ? recorded : fallback, attended) };
-};
-const STUDENT_COURSE_TOTALS_SQL = `
-    COALESCE(a.count, 0) AS attended,
-    COALESCE(c.completed_classes_count, 0) AS completed_classes_count,
-    (SELECT COALESCE(MAX(a2.count), 0) FROM attendances a2 WHERE a2.class_id = c.id) AS max_attended_in_class`;
-
 // The logged-in student's courses with attendance totals, in one request.
+// Totals count the lessons this student has a record for (present or absent).
 app.get("/student/courses", requireStudentAuth, async (req, res) => {
     logRequestStart(req);
     try {
@@ -2441,19 +1713,22 @@ app.get("/student/courses", requireStudentAuth, async (req, res) => {
             SELECT
                 c.id,
                 c.name,
-                ${STUDENT_COURSE_TOTALS_SQL}
-            FROM class_students cs
-            JOIN classes c ON c.id = cs.class_id
-            LEFT JOIN attendances a ON a.class_id = c.id AND a.student_id = cs.student_id
-            WHERE cs.student_id = $1
+                COALESCE(a.lessons_attended, 0) AS attended,
+                COALESCE(a.lessons_total, 0) AS total
+            FROM course_enrollments e
+            JOIN courses c ON c.id = e.course_id
+            LEFT JOIN student_course_attendance a ON a.course_id = e.course_id AND a.student_id = e.student_id
+            WHERE e.student_id = $1
             ORDER BY c.name ASC, c.id ASC
             `,
             [req.authStudentId]
         );
-        const courses = rows.map((row) => {
-            const { attended, total } = studentCourseTotals(row);
-            return { id: Number(row.id), name: row.name, attended, total };
-        });
+        const courses = rows.map((row) => ({
+            id: Number(row.id),
+            name: row.name,
+            attended: Number(row.attended) || 0,
+            total: Number(row.total) || 0,
+        }));
         return res.send({ courses });
     } catch (error) {
         logRouteError(req, "STUDENT_COURSES_FETCH_ERROR", error);
@@ -2461,15 +1736,8 @@ app.get("/student/courses", requireStudentAuth, async (req, res) => {
     }
 });
 
-// YYYY-MM-DD in Sofia time; groups legacy scans into lesson days.
-const sofiaDayFormatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Sofia",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-});
-
 // Lesson-by-lesson history of the logged-in student in one of their courses.
+// Lessons migrated without a date come first with date null.
 app.get("/student/courses/:classId/lessons", requireStudentAuth, async (req, res) => {
     logRequestStart(req);
     const classId = parsePositiveInteger(req.params.classId);
@@ -2478,79 +1746,26 @@ app.get("/student/courses/:classId/lessons", requireStudentAuth, async (req, res
     }
     try {
         const enrollment = await pool.query(
-            `
-            SELECT ${STUDENT_COURSE_TOTALS_SQL}
-            FROM class_students cs
-            JOIN classes c ON c.id = cs.class_id
-            LEFT JOIN attendances a ON a.class_id = c.id AND a.student_id = cs.student_id
-            WHERE cs.class_id = $1 AND cs.student_id = $2
-            LIMIT 1
-            `,
+            "SELECT 1 FROM course_enrollments WHERE course_id = $1 AND student_id = $2",
             [classId, req.authStudentId]
         );
         if (!enrollment.rows.length) {
             return res.status(404).send({ error: "Course not found" });
         }
-        // joined_at/left_at are TEXT in older databases, so they can't be COALESCEd
-        // with the timestamptz columns in SQL; pick and sort the lesson date here.
         const { rows } = await pool.query(
             `
-            SELECT status, joined_at, left_at, session_at, created_at
-            FROM attendance_timestamps
-            WHERE class_id = $1 AND student_id = $2
-            ORDER BY id ASC
+            SELECT l.started_at, ar.status_code
+            FROM attendance_records ar
+            JOIN lessons l ON l.id = ar.lesson_id
+            WHERE l.course_id = $1 AND ar.student_id = $2
+            ORDER BY l.started_at ASC NULLS FIRST, l.id ASC
             `,
             [classId, req.authStudentId]
         );
-        const toIsoOrNull = (value) => {
-            if (!value) return null;
-            const time = new Date(value).getTime();
-            return Number.isNaN(time) ? null : new Date(time).toISOString();
-        };
-        const ownLessons = rows.map((row) => ({
-            date: toIsoOrNull(row.session_at) || toIsoOrNull(row.joined_at) || toIsoOrNull(row.left_at) || toIsoOrNull(row.created_at),
-            status: row.joined_at || row.left_at ? "present" : (normalizeAttendanceStatus(row.status) || ATTENDANCE_ABSENT_STATUS),
+        const lessons = rows.map((row) => ({
+            date: row.started_at ? row.started_at.toISOString() : null,
+            status: row.status_code,
         }));
-
-        // Lessons finished before absences were stored (rows without session_id)
-        // left no row for students who missed them. Treat every Sofia calendar day
-        // on which someone in the class scanned as a lesson, and report the days
-        // this student has no row for as absences -- but never more than this
-        // student's own absence count, so the list matches their summary.
-        const toSofiaDay = (iso) => sofiaDayFormatter.format(new Date(iso));
-        const ownDays = new Set(ownLessons.filter((lesson) => lesson.date).map((lesson) => toSofiaDay(lesson.date)));
-        const { rows: classScanRows } = await pool.query(
-            `
-            SELECT joined_at, left_at
-            FROM attendance_timestamps
-            WHERE class_id = $1
-              AND student_id <> $2
-              AND session_id IS NULL
-              AND (joined_at IS NOT NULL OR left_at IS NOT NULL)
-            `,
-            [classId, req.authStudentId]
-        );
-        const firstScanByMissedDay = new Map();
-        for (const row of classScanRows) {
-            const date = toIsoOrNull(row.joined_at) || toIsoOrNull(row.left_at);
-            if (!date) continue;
-            const day = toSofiaDay(date);
-            if (ownDays.has(day)) continue;
-            const known = firstScanByMissedDay.get(day);
-            if (!known || Date.parse(date) < Date.parse(known)) firstScanByMissedDay.set(day, date);
-        }
-        const { attended, total } = studentCourseTotals(enrollment.rows[0]);
-        const storedAbsences = ownLessons.filter((lesson) => lesson.status === ATTENDANCE_ABSENT_STATUS).length;
-        const missingAbsences = Math.max(0, total - attended - storedAbsences);
-        // Keep the most recent days when there are more candidates than absences.
-        const derivedAbsences = Array.from(firstScanByMissedDay.values())
-            .sort((a, b) => Date.parse(b) - Date.parse(a))
-            .slice(0, missingAbsences)
-            .map((date) => ({ date, status: ATTENDANCE_ABSENT_STATUS }));
-
-        const lessons = ownLessons
-            .concat(derivedAbsences)
-            .sort((a, b) => (a.date ? Date.parse(a.date) : Infinity) - (b.date ? Date.parse(b.date) : Infinity) || 0);
         return res.send({ lessons });
     } catch (error) {
         logRouteError(req, "STUDENT_LESSONS_FETCH_ERROR", error);
@@ -2558,132 +1773,19 @@ app.get("/student/courses/:classId/lessons", requireStudentAuth, async (req, res
     }
 });
 
-app.get("/get_class_id_by_name", async (req, res) => {
-    logRequestStart(req);
-
-    var className = req.query.class_name;
-
-    const sql = `SELECT id FROM classes WHERE name = $1`;
-    const result  = await pool.query(sql, [className]);
-
-
-    if (result.rows.length === 0) {
-        return res.status(404).send({ error: "Class not found" });
-    }
-
-    const class_id = result.rows[0].id;
-
-
-    return res.send({
-        message: "Class ID fetched",
-        class_id: class_id
-    });
-});
-
-
-
-// ----------------- Attendance Recording Endpoint -----------------
-// Accepts body: { class_id, student_ids } or { class_id, student_id } or { class_id, faculty_number }
-app.post("/attendance", requireTeacherAuth, requireOwnedClass, async (req, res) => {
-    logRequestStart(req);
-    
-    const { class_id, student_ids, student_id, faculty_number } = req.body || {};
-
-
-    if (!class_id || (!student_ids && !student_id && !faculty_number)) {
-        return res.status(400).send({ error: "class_id and student_id or faculty_number are required" });
-    }
-
-    try {
-        const classIdNum = Number(class_id);
-        if (!Number.isFinite(classIdNum) || classIdNum <= 0) {
-            return res.status(400).send({ error: "class_id must be a valid number" });
-        }
-
-        // Verify class exists
-        const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classIdNum]);
-        if (classCheck.rows.length === 0) {
-            return res.status(404).send({ error: "Class not found" });
-        }
-
-        const upsertSql = `
-            INSERT INTO attendances (class_id, student_id)
-            VALUES ($1, $2)
-            ON CONFLICT (class_id, student_id)
-            DO UPDATE SET count = COALESCE(attendances.count, 0) + 1
-            RETURNING id, class_id, student_id, count
-        `;
-
-        // Branch 1: array of student IDs
-        if (Array.isArray(student_ids)) {
-            const studentIdsInt = student_ids
-                .map(value => Number(value))
-                .filter(Number.isFinite);
-
-            const uniqueIds = Array.from(new Set(studentIdsInt));
-
-            if (uniqueIds.length === 0) {
-                return res.status(400).send({ error: "No valid student_ids provided" });
-            }
-
-            const results = [];
-            for (const sid of uniqueIds) {
-                const { rows } = await pool.query(upsertSql, [classIdNum, sid]);
-                results.push(rows[0]);
-            }
-
-            return res.status(200).send({ success: true, attendance: results });
-        }
-
-        // Branch 2: single student_id or faculty_number
-        let resolvedStudentId = null;
-
-        if (student_id !== undefined && student_id !== null) {
-            const sid = Number(student_id);
-            if (!Number.isFinite(sid) || sid <= 0) {
-                return res.status(400).send({ error: "student_id must be a valid number" });
-            }
-            const studentCheck = await pool.query("SELECT id FROM students WHERE id = $1", [sid]);
-            if (studentCheck.rows.length === 0) {
-                return res.status(404).send({ error: "Student not found" });
-            }
-            resolvedStudentId = sid;
-        } else if (faculty_number) {
-            const facNorm = normalize(faculty_number);
-            const facHash = hashForLookup(facNorm);
-            const studentCheck = await pool.query(
-                "SELECT id FROM students WHERE faculty_number_hash = $1",
-                [facHash]
-            );
-            if (studentCheck.rows.length === 0) {
-                return res.status(404).send({ error: "Student not found" });
-            }
-            resolvedStudentId = studentCheck.rows[0].id;
-        }
-
-        if (!resolvedStudentId) {
-            return res.status(400).send({ error: "student_id or faculty_number is required" });
-        }
-
-        const { rows } = await pool.query(upsertSql, [classIdNum, resolvedStudentId]);
-        return res.status(200).send({ success: true, attendance: rows[0] });
-    } catch (error) {
-        logRouteError(req, "ATTENDANCE_RECORD_ERROR", error);
-        return res.status(500).send({ error: "Internal server error" });
-    }
-});
-
 // ----------------- Transactional Attendance Finish Endpoint -----------------
-// Accepts body:
+// Saves one lesson. Body:
 // {
 //   class_id: number,
-//   class_name?: string,
+//   session_id?: string,  // scanner session id; a retry with the same id updates the same lesson
 //   records: [{ student_id?, faculty_number?, status?, joined_at?, left_at? }]
 // }
+// A record with joined_at/left_at is saved as present, status "absent" without
+// times as absent; other records without times are ignored.
 app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
 
-    const { class_id, class_name, records, session_id } = req.body || {};
+    const { class_id, records, session_id } = req.body || {};
     const sessionId = normalizeAttendanceSessionId(session_id) || crypto.randomUUID();
     const classIdNum = parsePositiveInteger(class_id);
 
@@ -2695,11 +1797,6 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
         return res.status(400).send({ error: "records must be a non-empty array" });
     }
 
-    const classNameNormalized = typeof class_name === "string" ? class_name.trim() : null;
-    if (class_name !== undefined && class_name !== null && !classNameNormalized) {
-        return res.status(400).send({ error: "class_name must be a non-empty string when provided" });
-    }
-
     const client = await pool.connect();
     let transactionOpen = false;
 
@@ -2707,30 +1804,23 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
         await client.query("BEGIN");
         transactionOpen = true;
 
-        // Serialize writes for this class to keep idempotency deterministic across retries.
+        // Serialize writes for this class so retries of the same session stay deterministic.
         await client.query("SELECT pg_advisory_xact_lock($1::bigint)", [classIdNum]);
 
-        const classCheck = await client.query(
-            `
-            SELECT id, name
-            FROM classes
-            WHERE id = $1
-            LIMIT 1
-            `,
-            [classIdNum]
-        );
+        const classCheck = await client.query("SELECT id FROM courses WHERE id = $1", [classIdNum]);
         if (!classCheck.rows.length) {
             await client.query("ROLLBACK");
             transactionOpen = false;
             return res.status(404).send({ error: "Class not found" });
         }
 
-        const persistedClassName = classNameNormalized || classCheck.rows[0].name || null;
         const studentResolver = buildAttendanceStudentResolver(client);
 
         const validationErrors = [];
         const conflictErrors = [];
-        const candidateRecords = [];
+        // One entry per student; a scan wins over an absence, and several scans
+        // of one student merge into the widest time window.
+        const recordsByStudent = new Map();
 
         for (let index = 0; index < records.length; index += 1) {
             const record = records[index];
@@ -2759,9 +1849,8 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
 
             const resolvedById = await studentResolver.resolveById(rawStudentId);
             const resolvedByFaculty = await studentResolver.resolveByFacultyNumber(rawFacultyNumber);
-            const resolvedStudent = resolvedById || resolvedByFaculty;
 
-            if (resolvedById && resolvedByFaculty && Number(resolvedById.id) !== Number(resolvedByFaculty.id)) {
+            if (resolvedById && resolvedByFaculty && resolvedById !== resolvedByFaculty) {
                 conflictErrors.push({
                     index,
                     student_id: rawStudentId ?? null,
@@ -2771,7 +1860,8 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
                 continue;
             }
 
-            if (!resolvedStudent) {
+            const studentId = resolvedById || resolvedByFaculty;
+            if (!studentId) {
                 validationErrors.push({
                     index,
                     field: "student_id|faculty_number",
@@ -2811,19 +1901,17 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
                 continue;
             }
 
-            if (joinedAtParsed.value && leftAtParsed.value) {
-                const joinedAtMs = Date.parse(joinedAtParsed.value);
-                const leftAtMs = Date.parse(leftAtParsed.value);
-                if (Number.isFinite(joinedAtMs) && Number.isFinite(leftAtMs) && leftAtMs < joinedAtMs) {
-                    validationErrors.push({
-                        index,
-                        field: "left_at",
-                        message: "left_at must be after or equal to joined_at",
-                    });
-                    continue;
-                }
+            if (joinedAtParsed.value && leftAtParsed.value
+                && Date.parse(leftAtParsed.value) < Date.parse(joinedAtParsed.value)) {
+                validationErrors.push({
+                    index,
+                    field: "left_at",
+                    message: "left_at must be after or equal to joined_at",
+                });
+                continue;
             }
 
+            const existing = recordsByStudent.get(studentId);
             const hasTimeWindow = Boolean(joinedAtParsed.value || leftAtParsed.value);
             if (!hasTimeWindow) {
                 if (isPositiveAttendanceStatus(normalizedStatus)) {
@@ -2832,31 +1920,25 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
                         field: "joined_at|left_at",
                         message: "Positive attendance statuses require joined_at or left_at",
                     });
-                } else if (normalizedStatus === ATTENDANCE_ABSENT_STATUS) {
-                    const absentStudentId = Number(resolvedStudent.id);
-                    candidateRecords.push({
-                        studentId: absentStudentId,
+                } else if (normalizedStatus === ATTENDANCE_ABSENT_STATUS && !existing) {
+                    recordsByStudent.set(studentId, {
+                        studentId,
                         status: ATTENDANCE_ABSENT_STATUS,
                         joinedAt: null,
                         leftAt: null,
-                        sessionKey: buildAbsenceSessionKey({ classId: classIdNum, studentId: absentStudentId, sessionId }),
                     });
                 }
                 continue;
             }
 
-            const resolvedStudentId = Number(resolvedStudent.id);
-            candidateRecords.push({
-                studentId: resolvedStudentId,
-                status: normalizedStatus,
-                joinedAt: joinedAtParsed.value,
-                leftAt: leftAtParsed.value,
-                sessionKey: buildAttendanceSessionKey({
-                    classId: classIdNum,
-                    studentId: resolvedStudentId,
-                    joinedAt: joinedAtParsed.value,
-                    leftAt: leftAtParsed.value,
-                }),
+            const earliest = (a, b) => (!a ? b : !b ? a : (Date.parse(a) <= Date.parse(b) ? a : b));
+            const latest = (a, b) => (!a ? b : !b ? a : (Date.parse(a) >= Date.parse(b) ? a : b));
+            const wasPresent = existing?.status === ATTENDANCE_PRESENT_STATUS;
+            recordsByStudent.set(studentId, {
+                studentId,
+                status: ATTENDANCE_PRESENT_STATUS,
+                joinedAt: wasPresent ? earliest(existing.joinedAt, joinedAtParsed.value) : joinedAtParsed.value,
+                leftAt: wasPresent ? latest(existing.leftAt, leftAtParsed.value) : leftAtParsed.value,
             });
         }
 
@@ -2878,80 +1960,45 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
             });
         }
 
-        // A student who scanned is never also marked absent in the same session.
-        const presentStudentIds = new Set(
-            candidateRecords.filter((row) => row.status !== ATTENDANCE_ABSENT_STATUS).map((row) => row.studentId)
-        );
-        const uniqueRecordsBySessionKey = new Map();
-        for (const row of candidateRecords) {
-            if (row.status === ATTENDANCE_ABSENT_STATUS && presentStudentIds.has(row.studentId)) continue;
-            uniqueRecordsBySessionKey.set(`${row.studentId}:${row.sessionKey}`, row);
-        }
-        const recordsToPersist = Array.from(uniqueRecordsBySessionKey.values());
+        const recordsToPersist = Array.from(recordsByStudent.values());
 
-        // Lesson date: the earliest scan in this session, or now if nobody scanned.
-        const sessionTimes = recordsToPersist
+        // Lesson time: from the earliest to the latest scan, or now if nobody scanned.
+        const scanTimes = recordsToPersist
             .flatMap((row) => [row.joinedAt, row.leftAt])
-            .map((value) => (value ? Date.parse(value) : NaN))
-            .filter(Number.isFinite);
-        const sessionAt = new Date(sessionTimes.length ? Math.min(...sessionTimes) : Date.now()).toISOString();
+            .filter(Boolean)
+            .map((value) => Date.parse(value));
+        const startedAt = new Date(scanTimes.length ? Math.min(...scanTimes) : Date.now()).toISOString();
+        const endedAt = scanTimes.length ? new Date(Math.max(...scanTimes)).toISOString() : null;
+
+        const lessonResult = await client.query(
+            `
+            INSERT INTO lessons (course_id, started_at, ended_at, client_session_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (course_id, client_session_id) DO UPDATE SET
+                started_at = LEAST(lessons.started_at, EXCLUDED.started_at),
+                ended_at = GREATEST(lessons.ended_at, EXCLUDED.ended_at)
+            RETURNING id
+            `,
+            [classIdNum, startedAt, endedAt, sessionId]
+        );
+        const lessonId = lessonResult.rows[0].id;
 
         let insertedCount = 0;
         for (const row of recordsToPersist) {
-            const existing = await client.query(
+            const { rows } = await client.query(
                 `
-                SELECT id
-                FROM attendance_timestamps
-                WHERE class_id = $1
-                  AND student_id = $2
-                  AND session_key = $3
-                LIMIT 1
-                FOR UPDATE
+                INSERT INTO attendance_records (lesson_id, student_id, status_code, joined_at, left_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (lesson_id, student_id) DO UPDATE SET
+                    status_code = EXCLUDED.status_code,
+                    joined_at = EXCLUDED.joined_at,
+                    left_at = EXCLUDED.left_at
+                RETURNING (xmax = 0) AS inserted
                 `,
-                [classIdNum, row.studentId, row.sessionKey]
+                [lessonId, row.studentId, row.status, row.joinedAt, row.leftAt]
             );
-
-            if (existing.rows.length > 0) {
-                await client.query(
-                    `
-                    UPDATE attendance_timestamps
-                    SET
-                        joined_at = COALESCE($1, joined_at),
-                        left_at = COALESCE($2, left_at),
-                        status = COALESCE($3, status),
-                        class_name = COALESCE($4, class_name),
-                        session_id = COALESCE(session_id, $6),
-                        session_at = COALESCE(session_at, $7),
-                        updated_at = NOW()
-                    WHERE id = $5
-                    `,
-                    [row.joinedAt, row.leftAt, row.status, persistedClassName, existing.rows[0].id, sessionId, sessionAt]
-                );
-            } else {
-                insertedCount += 1;
-                await client.query(
-                    `
-                    INSERT INTO attendance_timestamps (
-                        class_id,
-                        student_id,
-                        session_key,
-                        status,
-                        class_name,
-                        joined_at,
-                        left_at,
-                        session_id,
-                        session_at,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-                    `,
-                    [classIdNum, row.studentId, row.sessionKey, row.status, persistedClassName, row.joinedAt, row.leftAt, sessionId, sessionAt]
-                );
-            }
+            if (rows[0]?.inserted) insertedCount += 1;
         }
-
-        await recomputeAttendanceSummaryForClass(client, classIdNum);
 
         await client.query("COMMIT");
         transactionOpen = false;
@@ -2960,6 +2007,7 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
         return res.status(statusCode).send({
             ok: true,
             saved: recordsToPersist.length,
+            lesson_id: Number(lessonId),
         });
     } catch (error) {
         if (transactionOpen) {
@@ -2976,86 +2024,44 @@ app.post("/attendance/finish", requireTeacherAuth, requireOwnedClass, async (req
     }
 });
 
-// List attendance entries optionally filtered by classId: /attendance?classId=...
-app.get("/attendance", requireTeacherAuth, requireOwnedClass, async (req, res) => {
-    logRequestStart(req);
-    
-    const classId = req.query.class_id;
-
-    try {
-        if (classId) {
-
-            const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classId]);
-            if (classCheck.rows.length === 0) {
-                return res.status(404).send({ error: "Class not found" });
-            }
-
-            const rows = await pool.query(`
-                SELECT a.id, a.class_id, a.student_id, a.count, s.full_name AS student_name
-                FROM attendances a
-                JOIN students s ON a.student_id = s.id
-                WHERE a.class_id = $1
-                ORDER BY a.updated_at DESC
-            `, [classId]);
-            return res.send({ message: "Attendance fetched", attendance: rows.rows });
-        }
-
-
-        const rows = await pool.query(`
-            SELECT a.id, a.class_id, a.student_id, a.updated_at,
-                         s.full_name AS student_name, c.name AS class_name
-            FROM attendances a
-            JOIN students s ON a.student_id = s.id
-            JOIN classes c ON a.class_id = c.id
-            ORDER BY a.updated_at DESC
-        `);
-        return res.send({ message: "All attendance fetched", attendance: rows.rows });
-    } catch (error) {
-        logRouteError(req, "ATTENDANCE_FETCH_ERROR", error);
-        res.status(500).send({ error: "Internal server error" });
-    }
-});
+// Scans (present records with times) of a class, newest first. Pass a student id
+// to get only that student's scans.
+const fetchClassScans = async (classId, studentId = null) => {
+    const { rows } = await pool.query(
+        `
+        SELECT
+            l.course_id AS class_id,
+            ar.student_id,
+            u.full_name,
+            st.faculty_number_encrypted,
+            ar.joined_at,
+            ar.left_at
+        FROM attendance_records ar
+        JOIN lessons l   ON l.id = ar.lesson_id
+        JOIN students st ON st.user_id = ar.student_id
+        JOIN users u     ON u.id = ar.student_id
+        WHERE l.course_id = $1
+          AND ($2::bigint IS NULL OR ar.student_id = $2)
+          AND (ar.joined_at IS NOT NULL OR ar.left_at IS NOT NULL)
+        ORDER BY COALESCE(ar.joined_at, ar.left_at) DESC
+        `,
+        [classId, studentId]
+    );
+    return rows.map((row) => withAttendanceStudentIdentifiers(row));
+};
 
 // ----------------- Attendance Timestamps Endpoint -----------------
 // Query: /attendance/timestamps?class_id=...
 app.get("/attendance/timestamps", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
 
-    const classId = req.query.class_id;
-
-    if (!classId) {
-        return res.status(400).send({ error: "class_id query parameter is required" });
-    }
-
-    const classIdNum = Number(classId);
-    if (!Number.isFinite(classIdNum) || classIdNum <= 0) {
+    const classIdNum = parsePositiveInteger(req.query.class_id);
+    if (!classIdNum) {
         return res.status(400).send({ error: "class_id must be a valid number" });
     }
 
     try {
-        const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classIdNum]);
-        if (classCheck.rows.length === 0) {
-            return res.status(404).send({ error: "Class not found" });
-        }
-
-        const rows = await pool.query(`
-            SELECT 
-                at.class_id,
-                at.student_id,
-                s.full_name,
-                s.faculty_number,
-                s.faculty_number_encrypted,
-                at.joined_at,
-                at.left_at
-            FROM attendance_timestamps at
-            JOIN students s ON at.student_id = s.id
-            WHERE at.class_id = $1
-              AND (at.joined_at IS NOT NULL OR at.left_at IS NOT NULL)
-            ORDER BY at.joined_at DESC
-        `, [classIdNum]);
-
-        const timestamps = rows.rows.map((row) => withAttendanceStudentIdentifiers(row));
-        return res.send({ timestamps });
+        return res.send({ timestamps: await fetchClassScans(classIdNum) });
     } catch (error) {
         logRouteError(req, "ATTENDANCE_TIMESTAMPS_FETCH_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
@@ -3069,12 +2075,8 @@ app.get("/attendance/history", requireTeacherAuth, requireOwnedClass, async (req
 
     const { class_id, student_id, faculty_number } = req.query || {};
 
-    if (!class_id) {
-        return res.status(400).send({ error: "class_id is required" });
-    }
-
-    const classIdNum = Number(class_id);
-    if (!Number.isFinite(classIdNum) || classIdNum <= 0) {
+    const classIdNum = parsePositiveInteger(class_id);
+    if (!classIdNum) {
         return res.status(400).send({ error: "class_id must be a valid number" });
     }
 
@@ -3082,51 +2084,20 @@ app.get("/attendance/history", requireTeacherAuth, requireOwnedClass, async (req
         let resolvedStudentId = null;
 
         if (student_id !== undefined && student_id !== null && String(student_id).length > 0) {
-            const sid = Number(student_id);
-            if (!Number.isFinite(sid) || sid <= 0) {
+            resolvedStudentId = parsePositiveInteger(student_id);
+            if (!resolvedStudentId) {
                 return res.status(400).send({ error: "student_id must be a valid number" });
             }
-            resolvedStudentId = sid;
         } else if (faculty_number) {
-            const facNorm = normalize(faculty_number);
-            const facHash = hashForLookup(facNorm);
-            const studentCheck = await pool.query(
-                "SELECT id FROM students WHERE faculty_number_hash = $1",
-                [facHash]
-            );
-            if (studentCheck.rows.length === 0) {
+            resolvedStudentId = await findStudentIdByFacultyNumber(pool, faculty_number);
+            if (!resolvedStudentId) {
                 return res.status(404).send({ error: "Student not found" });
             }
-            resolvedStudentId = studentCheck.rows[0].id;
         } else {
             return res.status(400).send({ error: "student_id or faculty_number is required" });
         }
 
-        const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classIdNum]);
-        if (classCheck.rows.length === 0) {
-            return res.status(404).send({ error: "Class not found" });
-        }
-
-        const { rows } = await pool.query(
-            `
-            SELECT
-                at.class_id,
-                at.student_id,
-                s.faculty_number,
-                s.faculty_number_encrypted,
-                at.joined_at,
-                at.left_at
-            FROM attendance_timestamps at
-            JOIN students s ON s.id = at.student_id
-            WHERE at.class_id = $1 AND at.student_id = $2
-              AND (at.joined_at IS NOT NULL OR at.left_at IS NOT NULL)
-            ORDER BY at.joined_at DESC
-            `,
-            [classIdNum, resolvedStudentId]
-        );
-
-        const records = rows.map((row) => withAttendanceStudentIdentifiers(row));
-        return res.status(200).send({ records });
+        return res.status(200).send({ records: await fetchClassScans(classIdNum, resolvedStudentId) });
     } catch (error) {
         logRouteError(req, "ATTENDANCE_HISTORY_FETCH_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
@@ -3135,38 +2106,29 @@ app.get("/attendance/history", requireTeacherAuth, requireOwnedClass, async (req
 
 // ----------------- Attendance Summary Endpoint -----------------
 // Query: /attendance/summary?class_id=...
-app.get("/attendance/summary", async (req, res) => {
+// Every enrolled student with the number of lessons they attended.
+app.get("/attendance/summary", requireTeacherAuth, requireOwnedClass, async (req, res) => {
     logRequestStart(req);
 
-    const classId = req.query.class_id;
-
-    if (!classId) {
-        return res.status(400).send({ error: "class_id is required" });
-    }
-
-    const classIdNum = Number(classId);
-    if (!Number.isFinite(classIdNum) || classIdNum <= 0) {
+    const classIdNum = parsePositiveInteger(req.query.class_id);
+    if (!classIdNum) {
         return res.status(400).send({ error: "class_id must be a valid number" });
     }
 
     try {
-        const classCheck = await pool.query("SELECT id FROM classes WHERE id = $1", [classIdNum]);
-        if (classCheck.rows.length === 0) {
-            return res.status(404).send({ error: "Class not found" });
-        }
-
         const { rows } = await pool.query(
             `
-            SELECT 
-                a.student_id,
-                s.full_name,
-                s.faculty_number,
-                s.faculty_number_encrypted,
-                COALESCE(a.count, 0) AS attendance_count
-            FROM attendances a
-            JOIN students s ON a.student_id = s.id
-            WHERE a.class_id = $1
-            ORDER BY s.full_name ASC
+            SELECT
+                e.student_id,
+                u.full_name,
+                st.faculty_number_encrypted,
+                COALESCE(a.lessons_attended, 0) AS attendance_count
+            FROM course_enrollments e
+            JOIN students st ON st.user_id = e.student_id
+            JOIN users u     ON u.id = e.student_id
+            LEFT JOIN student_course_attendance a ON a.course_id = e.course_id AND a.student_id = e.student_id
+            WHERE e.course_id = $1
+            ORDER BY u.full_name ASC
             `,
             [classIdNum]
         );
@@ -3183,91 +2145,39 @@ app.get("/attendance/summary", async (req, res) => {
 
 // ----------------- Remove Student from Class Endpoint -----------------
 // Expects body: { class_id: number, faculty_number: string }
-// Validates that teacher owns the class before deleting
+// The student's attendance records stay; only the enrollment is removed.
 app.post("/class_students/remove", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
-    const classId = req.body.class_id;
+    const classIdNum = parsePositiveInteger(req.body.class_id);
     const facultyNumberRaw = req.body.faculty_number;
     const facultyNumber = facultyNumberRaw ? String(facultyNumberRaw).trim() : facultyNumberRaw;
 
-    // Validate required fields
-    if (!classId || !facultyNumber) {
+    if (!classIdNum || !facultyNumber) {
         return res.status(400).send({ error: "class_id and faculty_number are required" });
     }
     try {
-        // Step 0: Resolve student by faculty number.
-        // Fast path uses hash, fallback handles legacy rows where hash/encrypted fields are missing.
-        const facultyNorm = normalize(facultyNumber);
-        const facultyHash = hashForLookup(facultyNorm);
-        const fastStudentResult = await pool.query(
-            `
-            SELECT id, faculty_number, faculty_number_encrypted, faculty_number_hash
-            FROM students
-            WHERE faculty_number_hash = $1
-            LIMIT 1
-            `,
-            [facultyHash]
-        );
-
-        let resolvedStudentRow = fastStudentResult.rows[0] || null;
-        if (!resolvedStudentRow) {
-            const fallbackCandidates = await pool.query(
-                `
-                SELECT id, faculty_number, faculty_number_encrypted, faculty_number_hash
-                FROM students
-                ORDER BY id ASC
-                LIMIT 10000
-                `
-            );
-            resolvedStudentRow = fallbackCandidates.rows.find((row) => {
-                return identifierMatches({
-                    inputNormalized: facultyNorm,
-                    rowHash: row.faculty_number_hash,
-                    rowPlain: row.faculty_number,
-                    rowEncrypted: row.faculty_number_encrypted,
-                });
-            }) || null;
-        }
-
-        if (!resolvedStudentRow) {
+        const studentId = await findStudentIdByFacultyNumber(pool, facultyNumber);
+        if (!studentId) {
             return res.status(404).send({ error: "Student not found with this faculty number" });
         }
-        const student_id = resolvedStudentRow.id;
 
-        const teacherId = req.authTeacherId;
+        if (!(await ensureTeacherOwnsClass(req, res, classIdNum, "You do not have permission to modify this class"))) return;
 
-        // Step 2: Verify teacher owns the class
-        const classResult = await pool.query(
-            "SELECT id, teacher_id FROM classes WHERE id = $1",
-            [classId]
+        const deleteResult = await pool.query(
+            "DELETE FROM course_enrollments WHERE course_id = $1 AND student_id = $2 RETURNING course_id, student_id",
+            [classIdNum, studentId]
         );
-        if (classResult.rows.length === 0) {
-            return res.status(404).send({ error: "Class not found" });
-        }
-        const classTeacherId = Number.parseInt(String(classResult.rows[0].teacher_id), 10);
-        if (!Number.isInteger(classTeacherId) || classTeacherId !== teacherId) {
-            return res.status(403).send({ error: "You do not have permission to modify this class" });
-        }
-
-        // Step 3: Verify student exists in class_students
-        const studentInClassResult = await pool.query(
-            "SELECT id FROM class_students WHERE class_id = $1 AND student_id = $2",
-            [classId, student_id]
-        );
-        if (studentInClassResult.rows.length === 0) {
+        if (deleteResult.rows.length === 0) {
             return res.status(404).send({ error: "Student not found in this class" });
         }
 
-        // Step 4: Delete the record from class_students
-        const deleteResult = await pool.query(
-            "DELETE FROM class_students WHERE class_id = $1 AND student_id = $2 RETURNING id",
-            [classId, student_id]
-        );
-
-        res.status(200).send({ 
+        res.status(200).send({
             message: "Student successfully removed from class",
-            deletedRecord: deleteResult.rows[0]
+            deletedRecord: {
+                class_id: Number(deleteResult.rows[0].course_id),
+                student_id: Number(deleteResult.rows[0].student_id),
+            }
         });
 
     } catch (error) {
@@ -3295,225 +2205,27 @@ app.all("/heartbeat", (req, res) => {
 
 
 
-
-
-app.post("/save_student_timestamps", requireTeacherAuth, requireOwnedClass, async (req, res) => {
+// Lessons are created by /attendance/finish, so there is no counter to update.
+// Kept so pages that still call it after Finish get a success response.
+app.post("/update_completed_classes_count", requireTeacherAuth, async (req, res) => {
     logRequestStart(req);
 
-    const classIdNum = parsePositiveInteger(req.body.class_id);
-    const studentFacultyNumber = req.body.faculty_number;
-    const joinedAtParsed = parseOptionalIsoTimestamp(req.body.joined_at);
-    const leftAtParsed = parseOptionalIsoTimestamp(req.body.left_at);
-
+    const classIdNum = parsePositiveInteger(req.body?.class_id);
     if (!classIdNum) {
         return res.status(400).send({ error: "class_id must be a valid positive integer" });
     }
-    if (!studentFacultyNumber || !String(studentFacultyNumber).trim()) {
-        return res.status(400).send({ error: "faculty_number is required" });
-    }
-    if (!joinedAtParsed.ok || !leftAtParsed.ok) {
-        return res.status(400).send({ error: "joined_at and left_at must be valid ISO timestamps" });
-    }
-    if (!joinedAtParsed.value && !leftAtParsed.value) {
-        return res.status(400).send({ error: `${studentFacultyNumber} has not been marked as attended.` });
-    }
 
-    if (joinedAtParsed.value && leftAtParsed.value) {
-        const joinedAtMs = Date.parse(joinedAtParsed.value);
-        const leftAtMs = Date.parse(leftAtParsed.value);
-        if (Number.isFinite(joinedAtMs) && Number.isFinite(leftAtMs) && leftAtMs < joinedAtMs) {
-            return res.status(400).send({ error: "left_at must be after or equal to joined_at" });
-        }
-    }
-
-    const client = await pool.connect();
-    let transactionOpen = false;
-
-    try {
-        await client.query("BEGIN");
-        transactionOpen = true;
-        await client.query("SELECT pg_advisory_xact_lock($1::bigint)", [classIdNum]);
-
-        const classCheck = await client.query(
-            `
-            SELECT id, name
-            FROM classes
-            WHERE id = $1
-            LIMIT 1
-            `,
-            [classIdNum]
-        );
-        if (!classCheck.rows.length) {
-            await client.query("ROLLBACK");
-            transactionOpen = false;
-            return res.status(404).send({ error: "Class not found" });
-        }
-
-        const studentResolver = buildAttendanceStudentResolver(client);
-        const studentRow = await studentResolver.resolveByFacultyNumber(studentFacultyNumber);
-        if (!studentRow?.id) {
-            await client.query("ROLLBACK");
-            transactionOpen = false;
-            return res.status(404).send({ error: "Student not found in database." });
-        }
-        const studentId = Number(studentRow.id);
-
-        const sessionKey = buildAttendanceSessionKey({
-            classId: classIdNum,
-            studentId,
-            joinedAt: joinedAtParsed.value,
-            leftAt: leftAtParsed.value,
-        });
-
-        const existing = await client.query(
-            `
-            SELECT id
-            FROM attendance_timestamps
-            WHERE class_id = $1
-              AND student_id = $2
-              AND session_key = $3
-            LIMIT 1
-            FOR UPDATE
-            `,
-            [classIdNum, studentId, sessionKey]
-        );
-
-        if (existing.rows.length > 0) {
-            await client.query(
-                `
-                UPDATE attendance_timestamps
-                SET
-                    joined_at = COALESCE($1, joined_at),
-                    left_at = COALESCE($2, left_at),
-                    status = COALESCE(status, 'completed'),
-                    class_name = COALESCE(class_name, $3),
-                    updated_at = NOW()
-                WHERE id = $4
-                `,
-                [joinedAtParsed.value, leftAtParsed.value, classCheck.rows[0].name || null, existing.rows[0].id]
-            );
-        } else {
-            await client.query(
-                `
-                INSERT INTO attendance_timestamps (
-                    class_id,
-                    student_id,
-                    session_key,
-                    status,
-                    class_name,
-                    joined_at,
-                    left_at,
-                    created_at,
-                    updated_at
-                )
-                VALUES ($1, $2, $3, 'completed', $4, $5, $6, NOW(), NOW())
-                `,
-                [classIdNum, studentId, sessionKey, classCheck.rows[0].name || null, joinedAtParsed.value, leftAtParsed.value]
-            );
-        }
-
-        await recomputeAttendanceSummaryForClass(client, classIdNum);
-        await client.query("COMMIT");
-        transactionOpen = false;
-
-        return res.send({
-            message: "Student timestamps saved"
-        });
-    } catch (error) {
-        if (transactionOpen) {
-            try {
-                await client.query("ROLLBACK");
-            } catch (rollbackError) {
-                logRouteError(req, "SAVE_TIMESTAMPS_ROLLBACK_ERROR", rollbackError);
-            }
-        }
-        logRouteError(req, "SAVE_TIMESTAMPS_ERROR", error);
-        return res.status(500).send({ error: "Internal server error" });
-    } finally {
-        client.release();
-    }
-
-});
-
-
-
-app.get("/get_student_attendance_count", requireTeacherAuth, requireOwnedClass, async (req, res) => {
-    logRequestStart(req);
-
-    var classId = req.query.class_id;
-    var studentId = req.query.student_id;
-    var facultyNumber = req.query.faculty_number;
-
-
-    if (!classId || (!studentId && !facultyNumber)) {
-        return res.status(400).send({ error: "class_id and student_id or faculty_number are required" });
-    }
-
-    const classIdNum = Number(classId);
-    if (!Number.isFinite(classIdNum) || classIdNum <= 0) {
-        return res.status(400).send({ error: "class_id must be a valid number" });
-    }
-
-    let studentIdNum = null;
-    const resolveFacultyNumber = facultyNumber || studentId;
-
-    if (resolveFacultyNumber) {
-        const facNorm = normalize(resolveFacultyNumber);
-        const facHash = hashForLookup(facNorm);
-        const studentLookup = await pool.query(
-            "SELECT id FROM students WHERE faculty_number_hash = $1",
-            [facHash]
-        );
-        if (studentLookup.rows.length === 0) {
-            return res.status(404).send({ error: "Student not found" });
-        }
-        studentIdNum = studentLookup.rows[0].id;
-    } else {
-        return res.status(400).send({ error: "student_id or faculty_number is required" });
-    }
-
-    const sqlForStudentAttendance = `
-        SELECT COALESCE((SELECT count FROM attendances WHERE class_id = $1 AND student_id = $2), 0) AS count
-    `;
-
-    const sqlForTotalCompletedClasses = `
-        SELECT COALESCE(completed_classes_count, 0) AS completed_classes_count FROM classes WHERE id = $1
-    `;
-
-    const result  = await pool.query(sqlForStudentAttendance, [classIdNum, studentIdNum]);
-    const result2 = await pool.query(sqlForTotalCompletedClasses, [classIdNum]);
-
-
-    const attendanceCount = Number(result.rows[0]?.count ?? 0);
-    const totalCompletedClassesCount = Number(result2.rows[0]?.completed_classes_count ?? 0);
-    
-
-    
-    return res.send({
-        message: "Student attendance count fetched",
-        attendance_count: attendanceCount,
-        total_completed_classes_count: totalCompletedClassesCount
-    });
-
-});
-
-
-
-app.post("/update_completed_classes_count", requireTeacherAuth, async (req, res) => {
-    logRequestStart(req);
-    
-    var classId = req.body.class_id;
-
-
-    const sql = `UPDATE classes SET completed_classes_count = completed_classes_count + 1 WHERE id = $1 AND teacher_id = $2`;
-    const result  = await pool.query(sql, [classId, req.authTeacherId]);
-    if (result.rowCount === 0) {
+    const { rows } = await pool.query(
+        `SELECT ${CLASS_COLUMNS_SQL} FROM courses c WHERE c.id = $1 AND c.teacher_id = $2`,
+        [classIdNum, req.authTeacherId]
+    );
+    if (rows.length === 0) {
         return res.status(404).send({ error: "Class not found for this teacher" });
     }
 
-    
     return res.send({
-        message: "Completed classes count updated"
+        message: "Completed classes count updated",
+        completed_classes_count: rows[0].completed_classes_count
     });
 
 });
@@ -3669,7 +2381,7 @@ app.post("/support/chat", requireTeacherAuth, async (req, res) => {
 
 
 
-const { exportBackup, downloadBackup, encryptBackup, decryptBackup, encryptUserFields, dropEncryptionColumns, importBackup } = createBackupHandlers({ pool, logRequestStart });
+const { exportBackup, downloadBackup, encryptBackup, decryptBackup, importBackup } = createBackupHandlers({ pool, logRequestStart });
 
 // ----------------- Database Backup Export Endpoint -----------------
 app.get("/backup/export", exportBackup);
@@ -3682,12 +2394,6 @@ app.post("/backup/encrypt", encryptBackup);
 
 // ----------------- Database Backup Decrypt Endpoint -----------------
 app.post("/backup/decrypt", decryptBackup);
-
-// ----------------- Database Backup Encrypt User Fields Endpoint -----------------
-app.post("/backup/encrypt-user-fields", encryptUserFields);
-
-// ----------------- Drop Encryption/Hash Columns Endpoint -----------------
-app.post("/backup/drop-encryption-columns", dropEncryptionColumns);
 
 // ----------------- Database Backup Import Endpoint -----------------
 app.post("/backup/import", importBackup);

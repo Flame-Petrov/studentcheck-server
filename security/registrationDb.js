@@ -1,11 +1,9 @@
 const UNIQUE_VIOLATION_CODE = "23505";
-const STUDENTS_PKEY = "students_pkey";
+const USERS_PKEY = "users_pkey";
 const KNOWN_EMAIL_CONSTRAINTS = new Set([
-    "uq_students_email_hash",
-    "students_email_hash_key",
+    "users_email_hash_key",
 ]);
 const KNOWN_FACULTY_CONSTRAINTS = new Set([
-    "uq_students_faculty_number_hash",
     "students_faculty_number_hash_key",
 ]);
 
@@ -13,7 +11,7 @@ const mapRegistrationUniqueViolation = (error) => {
     if (!error || error.code !== UNIQUE_VIOLATION_CODE) return null;
 
     const constraint = String(error.constraint || "").toLowerCase();
-    if (constraint === STUDENTS_PKEY) {
+    if (constraint === USERS_PKEY) {
         return { type: "id_collision", constraint };
     }
     if (KNOWN_EMAIL_CONSTRAINTS.has(constraint)) {
@@ -26,11 +24,11 @@ const mapRegistrationUniqueViolation = (error) => {
     return { type: "unknown_unique_violation", constraint };
 };
 
-const resyncStudentsIdSequence = async (pool) => {
+const resyncUsersIdSequence = async (pool) => {
     await pool.query(`
         SELECT setval(
-            pg_get_serial_sequence('students', 'id'),
-            COALESCE((SELECT MAX(id) FROM students), 1),
+            pg_get_serial_sequence('users', 'id'),
+            COALESCE((SELECT MAX(id) FROM users), 1),
             true
         );
     `);
@@ -54,10 +52,10 @@ const insertStudentWithIdCollisionRecovery = async ({
         logger.error("[REGISTRATION][ID_COLLISION]", {
             requestId,
             constraint: mapped.constraint,
-            message: "students.id sequence drift detected; resyncing sequence and retrying once",
+            message: "users.id sequence drift detected; resyncing sequence and retrying once",
         });
 
-        await resyncStudentsIdSequence(pool);
+        await resyncUsersIdSequence(pool);
 
         try {
             return await pool.query(insertSql, insertValues);
@@ -70,6 +68,6 @@ const insertStudentWithIdCollisionRecovery = async ({
 
 module.exports = {
     mapRegistrationUniqueViolation,
-    resyncStudentsIdSequence,
+    resyncUsersIdSequence,
     insertStudentWithIdCollisionRecovery,
 };

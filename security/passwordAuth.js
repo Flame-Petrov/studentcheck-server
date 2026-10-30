@@ -137,18 +137,46 @@ const verifyPasswordWithMigration = async ({
     };
 };
 
-const buildArgon2PasswordFields = async (plainPassword) => {
-    return {
-        password: null,
-        password_hash: await hashPassword(plainPassword),
-        hash_algorithm: ARGON2_ALGORITHM,
-        password_updated_at: new Date(),
-    };
+// Accounts carried over from the old database keep their old credentials as
+// "legacy-v1:<lookup hash>:<encrypted or plain password>" until their next login,
+// when the server replaces them with an argon2 hash.
+const LEGACY_PASSWORD_PREFIX = "legacy-v1:";
+
+const verifyStoredPassword = async ({
+    inputPassword,
+    storedHash,
+    legacyHashVerifier,
+    legacyDecryptor,
+}) => {
+    const stored = typeof storedHash === "string" ? storedHash : "";
+    if (!stored.startsWith(LEGACY_PASSWORD_PREFIX)) {
+        return verifyPasswordWithMigration({
+            inputPassword,
+            rowPassword: null,
+            rowPasswordHash: stored,
+            rowHashAlgorithm: null,
+            legacyHashVerifier,
+            legacyDecryptor,
+        });
+    }
+
+    const legacyPart = stored.slice(LEGACY_PASSWORD_PREFIX.length);
+    const separatorIndex = legacyPart.indexOf(":");
+    const lookupHash = separatorIndex === -1 ? legacyPart : legacyPart.slice(0, separatorIndex);
+    const oldPassword = separatorIndex === -1 ? "" : legacyPart.slice(separatorIndex + 1);
+    return verifyPasswordWithMigration({
+        inputPassword,
+        rowPassword: oldPassword || null,
+        rowPasswordHash: lookupHash || null,
+        rowHashAlgorithm: null,
+        legacyHashVerifier,
+        legacyDecryptor,
+    });
 };
 
 module.exports = {
-    ARGON2_ALGORITHM,
-    buildArgon2PasswordFields,
+    LEGACY_PASSWORD_PREFIX,
     hashPassword,
     verifyPasswordWithMigration,
+    verifyStoredPassword,
 };

@@ -29,7 +29,8 @@ const buildCheckEmailHandler = ({ pool, normalize, hashForLookup, minimumDuratio
         }
 
         const emailHash = hashForLookup(normalizedEmail);
-        const result = await pool.query("SELECT 1 FROM students WHERE email_hash = $1 LIMIT 1", [emailHash]);
+        // Any account (student or teacher) already using the email blocks registration.
+        const result = await pool.query("SELECT 1 FROM users WHERE email_hash = $1 LIMIT 1", [emailHash]);
         await finish();
         return res.status(200).send({ exists: result.rows.length > 0 });
     } catch {

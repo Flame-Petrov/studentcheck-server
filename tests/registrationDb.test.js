@@ -16,16 +16,16 @@ const run = async (name, fn) => {
 const runTests = async () => {
     await run("maps email/faculty/id unique violations by constraint name", async () => {
         assert.deepEqual(
-            mapRegistrationUniqueViolation({ code: "23505", constraint: "uq_students_email_hash" }),
-            { type: "duplicate_email", constraint: "uq_students_email_hash" }
+            mapRegistrationUniqueViolation({ code: "23505", constraint: "users_email_hash_key" }),
+            { type: "duplicate_email", constraint: "users_email_hash_key" }
         );
         assert.deepEqual(
-            mapRegistrationUniqueViolation({ code: "23505", constraint: "uq_students_faculty_number_hash" }),
-            { type: "duplicate_faculty_number", constraint: "uq_students_faculty_number_hash" }
+            mapRegistrationUniqueViolation({ code: "23505", constraint: "students_faculty_number_hash_key" }),
+            { type: "duplicate_faculty_number", constraint: "students_faculty_number_hash_key" }
         );
         assert.deepEqual(
-            mapRegistrationUniqueViolation({ code: "23505", constraint: "students_pkey" }),
-            { type: "id_collision", constraint: "students_pkey" }
+            mapRegistrationUniqueViolation({ code: "23505", constraint: "users_pkey" }),
+            { type: "id_collision", constraint: "users_pkey" }
         );
     });
 
@@ -38,7 +38,7 @@ const runTests = async () => {
             },
         };
 
-        const insertSql = "INSERT INTO students (full_name, email) VALUES ($1,$2) RETURNING id";
+        const insertSql = "INSERT INTO users (full_name, email_encrypted) VALUES ($1,$2) RETURNING id";
         await insertStudentWithIdCollisionRecovery({
             pool,
             insertSql,
@@ -60,7 +60,7 @@ const runTests = async () => {
                 if (count === 1) {
                     const err = new Error("duplicate key");
                     err.code = "23505";
-                    err.constraint = "students_pkey";
+                    err.constraint = "users_pkey";
                     throw err;
                 }
                 if (count === 2) {
@@ -73,7 +73,7 @@ const runTests = async () => {
 
         const result = await insertStudentWithIdCollisionRecovery({
             pool,
-            insertSql: "INSERT INTO students (full_name) VALUES ($1) RETURNING id",
+            insertSql: "INSERT INTO users (full_name) VALUES ($1) RETURNING id",
             insertValues: ["Name"],
             requestId: "req-2",
             logger: { error: () => {} },

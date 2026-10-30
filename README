@@ -17,3 +17,22 @@ SELECT * FROM {table name}
 - The External Database URL is in your database provider's dashboard.
   Keep it in the DATABASE_URL environment variable; never commit it. Example:
 psql "$DATABASE_URL"
+
+Database:
+
+- The schema lives in db/schema.sql. The server never creates or changes tables;
+  at startup it only logs DB_SCHEMA_MISSING_TABLES if some are missing.
+- New empty database:
+psql "$DATABASE_URL" -f db/schema.sql
+
+- Main tables: users (everyone who logs in, with a role), students (profile of a
+  student user), faculties / degrees / programs (lookup lists), courses (called
+  "classes" in the API), course_enrollments, lessons (one per attendance session),
+  attendance_records (one row per student per lesson) and attendance_statuses.
+  Lesson and attendance counts are not stored; the student_course_attendance view
+  counts them.
+- New attendance status (e.g. late): insert a row into attendance_statuses.
+  New faculty or specialization: insert rows into faculties / programs.
+- db/migrate_from_legacy.sql converted the old tables (teachers, classes,
+  class_students, attendances, attendance_timestamps) into this schema; the steps
+  are at the top of that file.

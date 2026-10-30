@@ -31,7 +31,7 @@ const resolveTeacherIdentity = async ({ req, pool, normalize, hashForLookup }) =
 
     if (jwtTeacherEmail) {
         const hash = hashForLookup(jwtTeacherEmail);
-        const result = await pool.query("SELECT id FROM teachers WHERE email_hash = $1", [hash]);
+        const result = await pool.query("SELECT id FROM users WHERE email_hash = $1 AND role = 'teacher'", [hash]);
         if (result.rows.length > 0) {
             return { teacherId: parsePositiveInt(result.rows[0].id), teacherEmail: jwtTeacherEmail, source: "jwt_email" };
         }
@@ -65,7 +65,7 @@ const buildPostClassStudentsHandler = ({ pool, normalize, hashForLookup, addStud
                 return res.status(401).send({ error: "Invalid or expired token" });
             }
 
-            const classResult = await pool.query("SELECT id, teacher_id FROM classes WHERE id = $1", [classId]);
+            const classResult = await pool.query("SELECT id, teacher_id FROM courses WHERE id = $1", [classId]);
             if (!classResult.rows.length) {
                 return res.status(404).send({ error: "Class not found" });
             }
