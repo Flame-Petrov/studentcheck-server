@@ -2468,19 +2468,28 @@ app.get("/student/courses/:classId/lessons", requireStudentAuth, async (req, res
         if (!enrollment.rows.length) {
             return res.status(404).send({ error: "Course not found" });
         }
+        // joined_at/left_at are TEXT in older databases, so they can't be COALESCEd
+        // with the timestamptz columns in SQL; pick and sort the lesson date here.
         const { rows } = await pool.query(
             `
             SELECT status, joined_at, left_at, session_at, created_at
             FROM attendance_timestamps
             WHERE class_id = $1 AND student_id = $2
-            ORDER BY COALESCE(session_at, joined_at, left_at, created_at) ASC, id ASC
+            ORDER BY id ASC
             `,
             [classId, req.authStudentId]
         );
-        const lessons = rows.map((row) => ({
-            date: row.session_at || row.joined_at || row.left_at || row.created_at || null,
-            status: row.joined_at || row.left_at ? "present" : (normalizeAttendanceStatus(row.status) || ATTENDANCE_ABSENT_STATUS),
-        }));
+        const toIsoOrNull = (value) => {
+            if (!value) return null;
+            const time = new Date(value).getTime();
+            return Number.isNaN(time) ? null : new Date(time).toISOString();
+        };
+        const lessons = rows
+            .map((row) => ({
+                date: toIsoOrNull(row.session_at) || toIsoOrNull(row.joined_at) || toIsoOrNull(row.left_at) || toIsoOrNull(row.created_at),
+                status: row.joined_at || row.left_at ? "present" : (normalizeAttendanceStatus(row.status) || ATTENDANCE_ABSENT_STATUS),
+            }))
+            .sort((a, b) => (a.date ? Date.parse(a.date) : Infinity) - (b.date ? Date.parse(b.date) : Infinity) || 0);
         return res.send({ lessons });
     } catch (error) {
         logRouteError(req, "STUDENT_LESSONS_FETCH_ERROR", error);
