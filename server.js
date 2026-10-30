@@ -2417,6 +2417,21 @@ app.get("/get_student_classes", async (req, res) => {
 
 
 // ----------------- Student self-service endpoints -----------------
+// Columns attended/completed_classes_count/max_attended_in_class come from
+// STUDENT_COURSE_TOTALS_SQL. Same rule the student page used before: the class's
+// completed count, else the highest count in the class, and never below this
+// student's count.
+const studentCourseTotals = (row) => {
+    const attended = Number(row.attended) || 0;
+    const recorded = Number(row.completed_classes_count) || 0;
+    const fallback = Number(row.max_attended_in_class) || 0;
+    return { attended, total: Math.max(recorded > 0 ? recorded : fallback, attended) };
+};
+const STUDENT_COURSE_TOTALS_SQL = `
+    COALESCE(a.count, 0) AS attended,
+    COALESCE(c.completed_classes_count, 0) AS completed_classes_count,
+    (SELECT COALESCE(MAX(a2.count), 0) FROM attendances a2 WHERE a2.class_id = c.id) AS max_attended_in_class`;
+
 // The logged-in student's courses with attendance totals, in one request.
 app.get("/student/courses", requireStudentAuth, async (req, res) => {
     logRequestStart(req);
@@ -2426,9 +2441,7 @@ app.get("/student/courses", requireStudentAuth, async (req, res) => {
             SELECT
                 c.id,
                 c.name,
-                COALESCE(a.count, 0) AS attended,
-                COALESCE(c.completed_classes_count, 0) AS completed_classes_count,
-                (SELECT COALESCE(MAX(a2.count), 0) FROM attendances a2 WHERE a2.class_id = c.id) AS max_attended_in_class
+                ${STUDENT_COURSE_TOTALS_SQL}
             FROM class_students cs
             JOIN classes c ON c.id = cs.class_id
             LEFT JOIN attendances a ON a.class_id = c.id AND a.student_id = cs.student_id
@@ -2438,12 +2451,7 @@ app.get("/student/courses", requireStudentAuth, async (req, res) => {
             [req.authStudentId]
         );
         const courses = rows.map((row) => {
-            const attended = Number(row.attended) || 0;
-            // Same rule the student page used before: the class's completed count,
-            // else the highest count in the class, and never below this student's count.
-            const recorded = Number(row.completed_classes_count) || 0;
-            const fallback = Number(row.max_attended_in_class) || 0;
-            const total = Math.max(recorded > 0 ? recorded : fallback, attended);
+            const { attended, total } = studentCourseTotals(row);
             return { id: Number(row.id), name: row.name, attended, total };
         });
         return res.send({ courses });
@@ -2451,6 +2459,14 @@ app.get("/student/courses", requireStudentAuth, async (req, res) => {
         logRouteError(req, "STUDENT_COURSES_FETCH_ERROR", error);
         return res.status(500).send({ error: "Internal server error" });
     }
+});
+
+// YYYY-MM-DD in Sofia time; groups legacy scans into lesson days.
+const sofiaDayFormatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Sofia",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
 });
 
 // Lesson-by-lesson history of the logged-in student in one of their courses.
@@ -2462,7 +2478,14 @@ app.get("/student/courses/:classId/lessons", requireStudentAuth, async (req, res
     }
     try {
         const enrollment = await pool.query(
-            "SELECT 1 FROM class_students WHERE class_id = $1 AND student_id = $2 LIMIT 1",
+            `
+            SELECT ${STUDENT_COURSE_TOTALS_SQL}
+            FROM class_students cs
+            JOIN classes c ON c.id = cs.class_id
+            LEFT JOIN attendances a ON a.class_id = c.id AND a.student_id = cs.student_id
+            WHERE cs.class_id = $1 AND cs.student_id = $2
+            LIMIT 1
+            `,
             [classId, req.authStudentId]
         );
         if (!enrollment.rows.length) {
@@ -2484,11 +2507,49 @@ app.get("/student/courses/:classId/lessons", requireStudentAuth, async (req, res
             const time = new Date(value).getTime();
             return Number.isNaN(time) ? null : new Date(time).toISOString();
         };
-        const lessons = rows
-            .map((row) => ({
-                date: toIsoOrNull(row.session_at) || toIsoOrNull(row.joined_at) || toIsoOrNull(row.left_at) || toIsoOrNull(row.created_at),
-                status: row.joined_at || row.left_at ? "present" : (normalizeAttendanceStatus(row.status) || ATTENDANCE_ABSENT_STATUS),
-            }))
+        const ownLessons = rows.map((row) => ({
+            date: toIsoOrNull(row.session_at) || toIsoOrNull(row.joined_at) || toIsoOrNull(row.left_at) || toIsoOrNull(row.created_at),
+            status: row.joined_at || row.left_at ? "present" : (normalizeAttendanceStatus(row.status) || ATTENDANCE_ABSENT_STATUS),
+        }));
+
+        // Lessons finished before absences were stored (rows without session_id)
+        // left no row for students who missed them. Treat every Sofia calendar day
+        // on which someone in the class scanned as a lesson, and report the days
+        // this student has no row for as absences -- but never more than this
+        // student's own absence count, so the list matches their summary.
+        const toSofiaDay = (iso) => sofiaDayFormatter.format(new Date(iso));
+        const ownDays = new Set(ownLessons.filter((lesson) => lesson.date).map((lesson) => toSofiaDay(lesson.date)));
+        const { rows: classScanRows } = await pool.query(
+            `
+            SELECT joined_at, left_at
+            FROM attendance_timestamps
+            WHERE class_id = $1
+              AND student_id <> $2
+              AND session_id IS NULL
+              AND (joined_at IS NOT NULL OR left_at IS NOT NULL)
+            `,
+            [classId, req.authStudentId]
+        );
+        const firstScanByMissedDay = new Map();
+        for (const row of classScanRows) {
+            const date = toIsoOrNull(row.joined_at) || toIsoOrNull(row.left_at);
+            if (!date) continue;
+            const day = toSofiaDay(date);
+            if (ownDays.has(day)) continue;
+            const known = firstScanByMissedDay.get(day);
+            if (!known || Date.parse(date) < Date.parse(known)) firstScanByMissedDay.set(day, date);
+        }
+        const { attended, total } = studentCourseTotals(enrollment.rows[0]);
+        const storedAbsences = ownLessons.filter((lesson) => lesson.status === ATTENDANCE_ABSENT_STATUS).length;
+        const missingAbsences = Math.max(0, total - attended - storedAbsences);
+        // Keep the most recent days when there are more candidates than absences.
+        const derivedAbsences = Array.from(firstScanByMissedDay.values())
+            .sort((a, b) => Date.parse(b) - Date.parse(a))
+            .slice(0, missingAbsences)
+            .map((date) => ({ date, status: ATTENDANCE_ABSENT_STATUS }));
+
+        const lessons = ownLessons
+            .concat(derivedAbsences)
             .sort((a, b) => (a.date ? Date.parse(a.date) : Infinity) - (b.date ? Date.parse(b.date) : Infinity) || 0);
         return res.send({ lessons });
     } catch (error) {
