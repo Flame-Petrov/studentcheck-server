@@ -525,7 +525,15 @@ const addStudentsToClass = async (classId, students) => {
 };
 
 // Central CORS configuration (explicit preflight + allowed headers)
-const allowedOrigins = ["https://studentcheck-9ucp.onrender.com"]; // frontend origin(s)
+// Frontend origin(s). Defaults to the production site; CORS_EXTRA_ORIGINS adds
+// more (comma-separated), e.g. a localhost origin when testing the UI locally.
+const allowedOrigins = [
+    "https://studentcheck-9ucp.onrender.com",
+    ...String(process.env.CORS_EXTRA_ORIGINS || "")
+        .split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean),
+];
 app.use(cors({
     origin: (origin, callback) => {
         // Allow same-origin / server-to-server (no origin header) or listed origins
@@ -541,8 +549,10 @@ app.use(cors({
 // Manual lightweight preflight handler (runs after cors sets headers)
 app.use((req, res, next) => {
     if (req.method === "OPTIONS") {
-        // Extra headers in case cors library missed something
-        res.header("Access-Control-Allow-Origin", allowedOrigins[0]);
+        // Extra headers in case cors library missed something. Echo the request's
+        // origin when it is allowed, so more than one allowed origin works.
+        const requestOrigin = req.headers.origin;
+        res.header("Access-Control-Allow-Origin", allowedOrigins.includes(requestOrigin) ? requestOrigin : allowedOrigins[0]);
         res.header("Access-Control-Allow-Credentials", "true");
         res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
         res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
