@@ -1,0 +1,36 @@
+name: Keep server awake
+
+# Pings the Render health endpoint so the free-tier instance does not spin down
+# while no one has the app open. The in-app ping (javascript/shared.js) covers
+# active use; this covers idle periods.
+#
+# Note: GitHub may delay or skip scheduled runs under load, so an occasional cold
+# start can still happen. Render free tier sleeps after ~15 min idle, so the
+# interval is kept well under that.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # every 10 minutes (UTC)
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /healthz
+        run: |
+          url="https://studentcheck-server.onrender.com/healthz"
+          # Allow a long timeout + retries: the first request after sleep has to
+          # wake the instance and can take 30-60s.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --max-time 120 --retry 3 --retry-delay 25 --retry-all-errors \
+            "$url" || echo 000)
+          echo "GET $url -> $code"
+          test "$code" = "200"
